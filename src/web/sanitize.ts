@@ -31,12 +31,26 @@ export function sanitizeScheduleName(raw: string): string {
     .replace(/^-|-$/g, '')
 }
 
+/**
+ * A DELIBERATE refusal, not a fault: the input tried to leave its base
+ * directory. A subclass of Error with the same message as before, so every
+ * existing catch and message check is unchanged; callers that must tell a
+ * refusal from an accident (the message router's per-row catch, which would
+ * otherwise record it as a reopenable delivery error) test instanceof.
+ */
+export class PathTraversalError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PathTraversalError'
+  }
+}
+
 // Joins segments and verifies the resolved path stays inside `base`. Throws on escape.
 export function safeJoin(base: string, ...parts: string[]): string {
   const resolvedBase = resolve(base)
   const target = resolve(base, ...parts)
   if (target !== resolvedBase && !target.startsWith(resolvedBase + sep)) {
-    throw new Error(`Path traversal rejected: ${parts.join('/')}`)
+    throw new PathTraversalError(`Path traversal rejected: ${parts.join('/')}`)
   }
   return target
 }

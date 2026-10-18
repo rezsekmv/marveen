@@ -48,8 +48,13 @@ import {
   DEVICE_KEY_SCOPES,
   OPERATOR_KEY_DEFAULT_EXPIRY_DAYS,
   OPERATOR_KEY_MAX_EXPIRY_DAYS,
+  MESSAGES_KEY_DEFAULT_EXPIRY_DAYS,
+  MESSAGES_KEY_MAX_EXPIRY_DAYS,
   type DeviceKeyScope,
 } from '../auth-device-keys.js'
+import { validateMessagesSenderId } from '../messages-gate.js'
+import { sanitizeAgentIdent } from '../../prompt-safety.js'
+import { MAIN_AGENT_ID, SYSTEM_SENDER_IDS, parseSystemSenderIds } from '../../config.js'
 import { removeBridgeSshAccess, sshDirOverride } from '../bridge-enroll.js'
 import {
   createDashboardUser,
@@ -142,11 +147,42 @@ function statusPayload(auth: RouteContext['auth']) {
   }
 }
 
+// Same frozen, normalized set the message route checks `from` against.
+const SYSTEM_SENDERS = parseSystemSenderIds(SYSTEM_SENDER_IDS, sanitizeAgentIdent)
+
+// GET /api/auth/whoami: who the caller's credential is, plus the main agent id.
+// Exists for the cc-link laptop link: with a messages-scoped key it must learn
+// which agent to address, and the place that answered that so far,
+// /api/team/graph, returns the whole team (agents, roles, paths) and stays
+// closed to such a key. So this returns the caller's OWN principal and the one
+// id it needs, nothing else: no agent list, no paths, no user list. Any
+// authenticated kind may ask (it only reflects what the caller already holds).
+function whoamiPayload(auth: NonNullable<RouteContext['auth']>) {
+  return {
+    kind: auth.kind,
+    ...(auth.kind === 'device' ? { scope: auth.scope, device: auth.device } : {}),
+    ...(auth.kind === 'device' && auth.scope === 'messages' && auth.senderId ? { sender_id: auth.senderId } : {}),
+    mainAgentId: MAIN_AGENT_ID,
+  }
+}
+
 export async function tryHandleAuth(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method, auth } = ctx
 
   if (path === '/api/auth/status' && method === 'GET') {
     json(res, statusPayload(auth))
+    return true
+  }
+
+  // A literal, not WHOAMI_PATH: the route-enumerating gate tests scan for '/api/...' strings.
+  if (path === '/api/auth/whoami' && method === 'GET') {
+    // Gated (/api/*), so a principal is always present; the guard keeps the
+    // handler safe if it is ever reached without one.
+    if (!auth) {
+      json(res, { error: 'Unauthorized' }, 401)
+      return true
+    }
+    json(res, whoamiPayload(auth))
     return true
   }
 
@@ -379,22 +415,51 @@ export async function tryHandleAuth(ctx: RouteContext): Promise<boolean> {
       json(res, { error: 'An operator key must expire' }, 400)
       return true
     }
+    // cc-link: a 'messages' key reaches its own mailbox only, as ONE sender
+    // bound here, and expires like an operator key (90 days unless set, max 365).
+    if (scope === 'messages' && (body.expires_in_days === 0 || body.expires_in_days === null)) {
+      json(res, { error: 'A messages key must expire' }, 400)
+      return true
+    }
+    let senderId: string | undefined
+    if (scope === 'messages') {
+      const senderErr = validateMessagesSenderId(body.sender_id)
+      if (senderErr) {
+        json(res, { error: senderErr }, 400)
+        return true
+      }
+      senderId = (body.sender_id as string).trim()
+    } else if (body.sender_id !== undefined) {
+      // A sender on a full/operator key would be a field nothing enforces;
+      // refusing it keeps the binding meaningful wherever it appears.
+      json(res, { error: 'sender_id is only valid for a messages key' }, 400)
+      return true
+    }
     // Expiry is opt-in for a full key: absent/0 means it lives until revoked.
-    let expiresInDays: number | undefined = scope === 'operator' ? OPERATOR_KEY_DEFAULT_EXPIRY_DAYS : undefined
+    let expiresInDays: number | undefined = scope === 'operator' ? OPERATOR_KEY_DEFAULT_EXPIRY_DAYS
+      : scope === 'messages' ? MESSAGES_KEY_DEFAULT_EXPIRY_DAYS : undefined
     if (body.expires_in_days !== undefined && body.expires_in_days !== null && body.expires_in_days !== 0) {
       const n = Number(body.expires_in_days)
-      // An operator key has its own, shorter ceiling (a year); a full key keeps 3650.
-      const maxDays = scope === 'operator' ? OPERATOR_KEY_MAX_EXPIRY_DAYS : DEVICE_KEY_MAX_EXPIRY_DAYS
+      // An operator/messages key has its own, shorter ceiling (a year); a full key keeps 3650.
+      const maxDays = scope === 'operator' ? OPERATOR_KEY_MAX_EXPIRY_DAYS
+        : scope === 'messages' ? MESSAGES_KEY_MAX_EXPIRY_DAYS : DEVICE_KEY_MAX_EXPIRY_DAYS
       if (!Number.isFinite(n) || n <= 0 || n > maxDays) {
         json(res, { error: `Invalid expires_in_days (1-${maxDays})` }, 400)
         return true
       }
       expiresInDays = n
     }
-    const minted = createDeviceKey(name, { expiresInDays, scope: scope as DeviceKeyScope })
-    logger.info({ id: minted.id, name: minted.name, expiresAt: minted.expiresAt, scope: minted.scope }, 'device key minted')
+    const minted = createDeviceKey(name, { expiresInDays, scope: scope as DeviceKeyScope, ...(senderId ? { senderId } : {}) })
+    logger.info({ id: minted.id, name: minted.name, expiresAt: minted.expiresAt, scope: minted.scope, senderId: minted.senderId ?? undefined }, 'device key minted')
+    // The binding alone does not make the id a valid sender: POST /api/messages
+    // still requires a SYSTEM_SENDER_IDS entry (and a reply to it lands only if
+    // listed). Not a 400, because the owner may mint first and edit .env (plus
+    // restart) second; but said now, not discovered as a 403 on the laptop.
+    const senderWarning = senderId && !SYSTEM_SENDERS.has(senderId)
+      ? { warning: `sender_id '${senderId}' is not in SYSTEM_SENDER_IDS yet: add it to .env and restart the dashboard, or every send with this key is refused` }
+      : {}
     // `key` is the one and only disclosure of the raw credential.
-    json(res, { ok: true, id: minted.id, name: minted.name, key: minted.key, created_at: minted.createdAt, expires_at: minted.expiresAt, scope: minted.scope }, 201)
+    json(res, { ok: true, id: minted.id, name: minted.name, key: minted.key, created_at: minted.createdAt, expires_at: minted.expiresAt, scope: minted.scope, ...(senderId ? { sender_id: senderId } : {}), ...senderWarning }, 201)
     return true
   }
 

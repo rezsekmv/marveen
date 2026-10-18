@@ -63,10 +63,12 @@ vi.mock('../web/voice-modality.js', () => ({ setLastInboundModality: vi.fn() }))
 vi.mock('../web/main-agent.js', () => ({ MAIN_CHANNELS_SESSION: 'orin-channels' }))
 vi.mock('../web/agent-message-wrap.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../web/agent-message-wrap.js')>()
+  const { PathTraversalError } = await import('../web/sanitize.js')
   return {
     ...real,
     classifyAgentMessage: (from: string) => {
       if (from === 'boom') throw new Error('classify exploded')
+      if (from === 'escaper') throw new PathTraversalError('Path traversal rejected: ../../etc')
       return { category: 'trusted-peer', safeFrom: from }
     },
   }
@@ -80,6 +82,7 @@ import {
 } from '../web/message-router.js'
 import { COORDINATOR_AGENT_ID, VOICE_CHANNEL_AGENT_ID } from '../channel-coordinator/ingest.js'
 import type { AgentMessage } from '../db.js'
+import { ROUTER_ABANDON_REASON, ROUTER_INJECT_GIVEUP_PREFIX, ROUTER_DELIVERY_ERROR_PREFIX, ROUTER_REFUSAL_PREFIX, isRouterRecoverableFailure } from '../router-failure-reasons.js'
 
 const MIN = 60_000
 const T0 = Date.UTC(2026, 8, 25, 10, 0, 0)
@@ -195,8 +198,33 @@ describe('71263d15 (A): the absence clock decides, not the message age', () => {
     present.set('agent-gus', true); ready.set('agent-gus', true)
     await tickAt(T0)
     expect(failedIds()).toContain(701)
+    const call701 = mockMarkFailed.mock.calls.find((c) => c[0] === 701)!
+    expect(String(call701[1]).startsWith(ROUTER_DELIVERY_ERROR_PREFIX)).toBe(true)
+    expect(call701[2]).toEqual({ by: 'router' })
+    expect(noticesTo('orin').some((c) => String(c[2]).includes('id 701') && String(c[2]).includes('delivery error'))).toBe(true)
+    expect(String(noticesTo('boom')[0]?.[2])).toContain('kézbesítési hiba a routerben')
     expect(noticesTo('boom')).toHaveLength(1)
     expect(noticesTo('orin').some((c) => String(c[2]).includes('id 701'))).toBe(true)
+  })
+
+  it('(a7b) a deliberate refusal (PathTraversalError) is closed as Refused:, WITHOUT router provenance', async () => {
+    queue(row(711, 'gus', 'escaper', T0))
+    present.set('agent-gus', true); ready.set('agent-gus', true)
+    await tickAt(T0)
+    const call = mockMarkFailed.mock.calls.find((c) => c[0] === 711)!
+    expect(String(call[1])).toBe(`${ROUTER_REFUSAL_PREFIX}PathTraversalError: Path traversal rejected: ../../etc`)
+    expect(call[2]).toBeUndefined()
+    expect(isRouterRecoverableFailure(String(call[1]))).toBe(false)
+    // Both parties still hear about it, worded as a refusal, never as a delivery error to re-send.
+    const toMain = noticesTo('orin').map((c) => String(c[2])).filter((t) => t.includes('id 711'))
+    expect(toMain).toHaveLength(1)
+    expect(toMain[0]).toContain('[handoff-failure]')
+    expect(toMain[0]).toContain('REFUSED')
+    expect(toMain[0]).not.toMatch(/delivery error|could NOT be delivered|Consider re-sending/i)
+    const toSender = noticesTo('escaper').map((c) => String(c[2]))
+    expect(toSender).toHaveLength(1)
+    expect(toSender[0]).toContain('elutasította')
+    expect(toSender[0]).not.toMatch(/kézbesítési hiba a routerben|ha még számít, küldd újra/)
   })
 
   it('a row closed concurrently (markMessageFailed affected 0 rows) earns no sender notice', async () => {
@@ -206,6 +234,44 @@ describe('71263d15 (A): the absence clock decides, not the message age', () => {
     mockMarkFailed.mockReturnValueOnce(false)
     await tickAt(T0 + 61 * MIN)
     expect(noticesTo('geri')).toHaveLength(0)
+    // Nor a "could NOT be delivered" to the main agent: with the status-guarded
+    // closers, 0 rows most often means the recipient closed it first (PUT done).
+    expect(noticesTo('orin').some((c) => String(c[2]).includes('id 801'))).toBe(false)
+  })
+
+  it('an inject give-up on a row closed concurrently notifies nobody (main agent included)', async () => {
+    queue(row(811, 'hal', 'geri', T0))
+    present.set('agent-hal', true); ready.set('agent-hal', true)
+    mockSendPrompt.mockImplementation(async () => { throw new Error('send-keys failed') })
+    await tickAt(T0)
+    await tickAt(T0 + 5_000)
+    mockMarkFailed.mockReturnValueOnce(false)
+    await tickAt(T0 + 10_000)
+    expect(failedIds()).toContain(811)
+    expect(noticesTo('geri')).toHaveLength(0)
+    expect(noticesTo('orin').some((c) => String(c[2]).includes('id 811'))).toBe(false)
+  })
+
+  it('the router writes its failure reasons from the shared constants (what a late PUT done is matched on)', async () => {
+    queue(row(821, 'jo', 'geri', T0))
+    present.set('agent-jo', false)
+    await tickAt(T0)
+    await tickAt(T0 + 61 * MIN)
+    queue(row(822, 'kai', 'geri', T0))
+    present.set('agent-kai', true); ready.set('agent-kai', true)
+    mockSendPrompt.mockImplementation(async () => { throw new Error('send-keys failed') })
+    await tickAt(T0 + 62 * MIN)
+    await tickAt(T0 + 62 * MIN + 5_000)
+    await tickAt(T0 + 62 * MIN + 10_000)
+    const reasonOf = (id: number) => String(mockMarkFailed.mock.calls.find((c) => c[0] === id)?.[1])
+    expect(reasonOf(821)).toBe(ROUTER_ABANDON_REASON)
+    expect(reasonOf(822).startsWith(ROUTER_INJECT_GIVEUP_PREFIX)).toBe(true)
+    expect(isRouterRecoverableFailure(reasonOf(821))).toBe(true)
+    expect(isRouterRecoverableFailure(reasonOf(822))).toBe(true)
+    // ...and marks them as ITS closes (failed_by = 'router'), the provenance a late done requires.
+    const optsOf = (id: number) => mockMarkFailed.mock.calls.find((c) => c[0] === id)?.[2]
+    expect(optsOf(821)).toEqual({ by: 'router' })
+    expect(optsOf(822)).toEqual({ by: 'router' })
   })
   it('(a8) ⛔ S1: after an abandon, a recipient that came back unobserved does not keep the old clock', async () => {
     // S1a: its rows were all abandoned, so no tick looked at the recipient any more;

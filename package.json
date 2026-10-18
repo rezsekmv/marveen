@@ -16,7 +16,8 @@
     "syntax-check": "node --check web/app.js web/sw.js",
     "smoke": "playwright test --config=playwright.config.ts",
     "skill": "tsx scripts/skill.ts",
-    "browser-verify": "playwright test --config=playwright.browser.config.ts"
+    "browser-verify": "playwright test --config=playwright.browser.config.ts",
+    "test:cc-link": "cd tools/cc-link-mcp && bun install --frozen-lockfile && bun test && bun run typecheck"
   },
   "engines": {
     "node": ">=22"

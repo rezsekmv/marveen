@@ -14316,15 +14316,70 @@ function renderDeviceKeysSection(body) {
     `<div class="auth-form-msg err auth-device-warn" id="authDeviceKeyWarn" hidden></div>` +
     `<div id="authDeviceKeyList"></div>` +
     `<div class="auth-form auth-device-mint">` +
-      `<input id="authDevName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.devices.name_placeholder')}">` +
-      `<input id="authDevExpiry" type="number" min="1" max="3650" placeholder="${t('auth.devices.expiry_placeholder')}">` +
+      // Key type: a full key (the whole dashboard API, as before) or a
+      // messages-only key for the cc-link laptop link (tools/cc-link-mcp).
+      `<div class="auth-device-type" role="radiogroup" aria-label="${t('auth.devices.type_label')}">` +
+        `<label class="auth-operator-switch"><input type="radio" name="authDevType" value="full" checked> ${t('auth.devices.type_full')}</label> ` +
+        `<label class="auth-operator-switch"><input type="radio" name="authDevType" value="messages"> ${t('auth.devices.type_messages')}</label>` +
+      `</div>` +
+      `<div class="auth-device-field">` +
+        `<label class="form-label-sm" for="authDevName">${t('auth.devices.name_label')}</label>` +
+        `<input id="authDevName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.devices.name_placeholder')}">` +
+      `</div>` +
+      `<div class="auth-device-field" id="authDevExpiryField">` +
+        `<label class="form-label-sm" for="authDevExpiry">${t('auth.devices.expiry_label')}</label>` +
+        `<div class="auth-device-field-row">` +
+          `<input id="authDevExpiry" type="number" min="1" max="3650" placeholder="${t('auth.devices.expiry_placeholder')}">` +
+          `<span class="auth-device-unit">${t('auth.devices.days_unit')}</span>` +
+        `</div>` +
+      `</div>` +
+      `<div id="authDevMsgFields" class="auth-device-msg-fields" hidden>` +
+        `<p class="auth-muted">${t('auth.devices.messages_desc')}</p>` +
+        `<div class="auth-device-field">` +
+          `<label class="form-label-sm" for="authDevSender">${t('auth.devices.sender_label')}</label>` +
+          `<input id="authDevSender" type="text" autocapitalize="off" spellcheck="false" maxlength="${DEVICE_KEY_SENDER_ID_MAX}" placeholder="${t('auth.devices.sender_placeholder')}">` +
+        `</div>` +
+        `<div class="auth-device-field">` +
+          `<label class="form-label-sm" for="authDevMsgExpiry">${t('auth.devices.messages_expiry_label')}</label>` +
+          `<div class="auth-device-field-row">` +
+            `<input id="authDevMsgExpiry" type="number" min="1" max="${MESSAGES_KEY_MAX_EXPIRY_DAYS}" value="${MESSAGES_KEY_DEFAULT_EXPIRY_DAYS}" placeholder="${t('auth.devices.messages_expiry_placeholder')}">` +
+            `<span class="auth-device-unit">${t('auth.devices.days_unit')}</span>` +
+          `</div>` +
+        `</div>` +
+      `</div>` +
       `<button class="btn-secondary" id="authDevMintBtn">${t('auth.devices.mint')}</button>` +
       `<div class="auth-form-msg" id="authDevMsg"></div>` +
       `<div id="authDevMinted" hidden></div>` +
     `</div>`
   body.appendChild(wrap)
   document.getElementById('authDevMintBtn').addEventListener('click', mintDeviceKey)
+  wrap.querySelectorAll('input[name=authDevType]').forEach((r) => r.addEventListener('change', syncDeviceKeyTypeFields))
+  // A validation or server error describes the values it was raised for: once
+  // the user edits a field or switches the type, it no longer applies.
+  const mintForm = wrap.querySelector('.auth-device-mint')
+  for (const ev of ['input', 'change']) mintForm.addEventListener(ev, clearDeviceKeyFormError)
   refreshDeviceKeyList()
+}
+
+function clearDeviceKeyFormError(ev) {
+  if (ev && ev.target && ev.target.closest && ev.target.closest('#authDevMinted')) return
+  const msg = document.getElementById('authDevMsg')
+  if (!msg || !msg.classList.contains('err')) return
+  msg.className = 'auth-form-msg'
+  msg.textContent = ''
+}
+
+function selectedDeviceKeyType() {
+  const r = document.querySelector('input[name=authDevType]:checked')
+  return r && r.value === 'messages' ? 'messages' : 'full'
+}
+
+// The full key keeps its optional expiry field; a messages key swaps it for
+// the sender id + mandatory expiry pair.
+function syncDeviceKeyTypeFields() {
+  const messages = selectedDeviceKeyType() === 'messages'
+  document.getElementById('authDevMsgFields').hidden = !messages
+  document.getElementById('authDevExpiryField').hidden = messages
 }
 
 async function refreshDeviceKeyList() {
@@ -14339,8 +14394,17 @@ async function refreshDeviceKeyList() {
       const created = new Date(k.createdAt * 1000).toLocaleDateString()
       const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt * 1000).toLocaleString() : t('auth.devices.never_used')
       const expires = k.expiresAt ? ` &middot; ${t('auth.devices.expires', { date: new Date(k.expiresAt * 1000).toLocaleDateString() })}` : ''
-      const bridge = k.installId ? ` <span class="auth-device-bridge-badge">${t('auth.devices.bridge_badge')}</span>` : ''
+      // Parenthesized: the scope badges below must render whether or not the key
+      // is Bridge-paired (unparenthesized, they belonged to the ternary's '' arm,
+      // so a Bridge key hid its scope, the unknown-scope warning included).
+      const bridge = (k.installId ? ` <span class="auth-device-bridge-badge">${t('auth.devices.bridge_badge')}</span>` : '')
         + (k.scope === 'operator' ? ` <span class="auth-device-bridge-badge">${t('auth.operator.badge')}</span>` : '')
+        + (k.scope === 'messages' ? ` <span class="auth-device-bridge-badge">${t('auth.devices.messages_badge', { sender: escapeHtml(k.senderId || '?') })}</span>`
+          + (k.expiresAt ? ` <span class="auth-device-bridge-badge auth-device-expiry-badge">${t('auth.devices.expires', { date: new Date(k.expiresAt * 1000).toLocaleDateString() })}</span>` : '') : '')
+        // A stored scope this build does not know: the server refuses the key
+        // outright (auth-device-keys.ts toScope), so without a badge it would
+        // look like a working full key. Tell the owner to revoke it.
+        + (k.scope === 'unknown' ? ` <span class="auth-device-bridge-badge auth-device-unknown-badge">${t('auth.devices.unknown_badge')}</span>` : '')
       return `<div class="auth-session-row auth-device-row" data-key-id="${k.id}">` +
         `<span class="auth-device-name">${escapeHtml(k.name)}${bridge}</span>` +
         `<span class="auth-device-meta">${created} &middot; ${t('auth.devices.last_used', { date: lastUsed })}${expires}</span>` +
@@ -14373,16 +14437,54 @@ async function refreshDeviceKeyList() {
   } catch { el.innerHTML = '' }
 }
 
+// Mirrors POST /api/auth/device-keys (src/web/routes/auth.ts) for the 'messages'
+// scope so the obvious mistakes are caught before the round trip: sender id
+// required, at most 64 chars of letters/digits/_/-, expiry 1..365 (empty means
+// the server default of 90). The server stays the authority (reserved ids,
+// fleet agents): its 400 text is shown as is. A full key keeps the old,
+// unvalidated form. Returns { error, params } (i18n key) or { body }.
+const MESSAGES_KEY_DEFAULT_EXPIRY_DAYS = 90
+const MESSAGES_KEY_MAX_EXPIRY_DAYS = 365
+const DEVICE_KEY_SENDER_ID_MAX = 64
+function buildDeviceKeyRequestBody(fields) {
+  const name = String((fields && fields.name) || '').trim()
+  if (!name) return { error: 'auth.devices.err_name' }
+  const expiryRaw = String((fields && fields.expiry) ?? '').trim()
+  if (!fields || fields.type !== 'messages') {
+    const body = { name }
+    if (expiryRaw) body.expires_in_days = Number(expiryRaw)
+    return { body }
+  }
+  const sender = String(fields.sender || '').trim()
+  if (!sender) return { error: 'auth.devices.err_sender_required' }
+  if (sender.length > DEVICE_KEY_SENDER_ID_MAX) return { error: 'auth.devices.err_sender_long', params: { max: DEVICE_KEY_SENDER_ID_MAX } }
+  if (!/^[A-Za-z0-9_-]+$/.test(sender)) return { error: 'auth.devices.err_sender_chars' }
+  const body = { name, scope: 'messages', sender_id: sender }
+  if (expiryRaw) {
+    const n = Number(expiryRaw)
+    if (!Number.isFinite(n) || n <= 0 || n > MESSAGES_KEY_MAX_EXPIRY_DAYS) {
+      return { error: 'auth.devices.err_messages_expiry', params: { max: MESSAGES_KEY_MAX_EXPIRY_DAYS } }
+    }
+    body.expires_in_days = n
+  }
+  return { body }
+}
+
 async function mintDeviceKey() {
   const msg = document.getElementById('authDevMsg')
   const minted = document.getElementById('authDevMinted')
-  const name = (document.getElementById('authDevName').value || '').trim()
-  const expiryRaw = document.getElementById('authDevExpiry').value
+  const type = selectedDeviceKeyType()
   msg.className = 'auth-form-msg'
+  msg.textContent = ''
   minted.hidden = true
-  if (!name) { msg.classList.add('err'); msg.textContent = t('auth.devices.err_name'); return }
-  const payload = { name }
-  if (expiryRaw) payload.expires_in_days = Number(expiryRaw)
+  const built = buildDeviceKeyRequestBody({
+    type,
+    name: document.getElementById('authDevName').value,
+    expiry: document.getElementById(type === 'messages' ? 'authDevMsgExpiry' : 'authDevExpiry').value,
+    sender: document.getElementById('authDevSender').value,
+  })
+  if (built.error) { msg.classList.add('err'); msg.textContent = t(built.error, built.params || {}); return }
+  const payload = built.body
   try {
     const r = await fetch('/api/auth/device-keys', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -14392,13 +14494,16 @@ async function mintDeviceKey() {
     if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
     document.getElementById('authDevName').value = ''
     document.getElementById('authDevExpiry').value = ''
+    document.getElementById('authDevSender').value = ''
+    document.getElementById('authDevMsgExpiry').value = String(MESSAGES_KEY_DEFAULT_EXPIRY_DAYS)
     minted.hidden = false
     minted.innerHTML =
       `<p class="auth-muted">${t('auth.devices.minted_hint')}</p>` +
       `<div class="auth-form auth-device-minted-row">` +
         `<input id="authDevMintedKey" type="text" readonly value="${escapeHtml(data.key)}" onclick="this.select()">` +
         `<button class="btn-secondary btn-compact" id="authDevCopyBtn">${t('auth.devices.copy')}</button>` +
-      `</div>`
+      `</div>` +
+      (data.scope === 'messages' ? messagesKeyGuideHtml(data) : '')
     document.getElementById('authDevCopyBtn').addEventListener('click', async () => {
       try {
         await navigator.clipboard.writeText(data.key)
@@ -14407,6 +14512,29 @@ async function mintDeviceKey() {
     })
     refreshDeviceKeyList()
   } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+}
+
+// Where a messages key goes on the laptop (tools/cc-link-mcp/README.md), and,
+// when the server says the sender id is not a SYSTEM_SENDER_IDS entry yet, the
+// one fix that makes the key usable at all.
+function messagesKeyGuideHtml(data) {
+  const sender = escapeHtml(data.sender_id || '')
+  const expires = data.expires_at ? new Date(data.expires_at * 1000).toLocaleDateString() : ''
+  const warn = data.warning
+    ? `<div class="auth-form-msg err auth-device-warn" id="authDevMintedWarn">` +
+        `<strong>${t('auth.devices.messages_warning', { sender })}</strong>` +
+        `<br>${escapeHtml(data.warning)}` +
+      `</div>`
+    : ''
+  return warn +
+    `<div class="auth-muted auth-device-guide" id="authDevMintedGuide">` +
+      `<div class="auth-sessions-title">${t('auth.devices.guide_title')}</div>` +
+      `<ul>` +
+        `<li>${t('auth.devices.guide_key')}</li>` +
+        `<li>${t('auth.devices.guide_sender', { sender })}</li>` +
+        (expires ? `<li>${t('auth.devices.guide_expiry', { date: expires })}</li>` : '') +
+      `</ul>` +
+    `</div>`
 }
 
 // === IT operator access (DASHOPERATOR1005) ===

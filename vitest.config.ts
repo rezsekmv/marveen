@@ -31,7 +31,10 @@ export default defineConfig({
     // 'claude-code/testing', which exists only under `claude plugin test`
     // (the engine supplies it); under vitest they cannot even load. They are
     // run with `claude plugin test plugins/<mod>` (MODSTERMEK1005).
-    exclude: [...configDefaults.exclude, 'dist/**', 'tests/smoke/**', 'tests/browser/**', 'vendor/**', 'plugins/*/tests/**'],
+    // tools/cc-link-mcp/**: a Bun sub-project with its own package.json; its
+    // tests import 'bun:test' and run with `bun test` inside that directory.
+    // Under the root vitest they cannot even load.
+    exclude: [...configDefaults.exclude, 'dist/**', 'tests/smoke/**', 'tests/browser/**', 'vendor/**', 'plugins/*/tests/**', 'tools/cc-link-mcp/**'],
     // vitest 4 enforces the 5s default testTimeout on tests that vitest 2 let
     // run long. Three subprocess-spawning tests (send-honesty-final,
     // send-honesty-round2) legitimately take 15-30s: they shell out to

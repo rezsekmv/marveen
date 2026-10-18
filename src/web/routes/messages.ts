@@ -2,7 +2,7 @@ import {
   createAgentMessage, getPendingMessages, listAgentMessages, getRecipientQueueState,
   getAgentConversation, getAgentConversationThreads,
   getKanbanSeqByIdPrefix,
-  markMessageDone, markMessageFailed, getAgentMessage,
+  markMessageDone, markMessageFailed, markRouterFailedMessageDone, getAgentMessage,
   closeOtelSpan,
   getPendingBacklogByAgent,
   countNewerMessagesForRows,
@@ -18,6 +18,7 @@ import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { isKnownAgent } from '../agent-config.js'
 import { MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, OWNER_NAME, SYSTEM_SENDER_IDS, parseSystemSenderIds, MESSAGE_URGENT_DEVICE_IDS, parseDeviceKeyIds } from '../../config.js'
 import { isAgentRunning } from '../agent-process.js'
+import { messagesKeyOwnsRow, messagesKeySender } from '../messages-gate.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import { isHeartbeatTemplateLeak, stampHeartbeatHeader } from '../heartbeat-header-stamp.js'
@@ -160,6 +161,18 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       { from: string; to: string; content: string; origin_note?: string; urgent?: unknown }
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
+      return true
+    }
+    // cc-link: a messages-scoped key IS its sender (bound at mint time), so its
+    // `from` is not a claim like the shared token's, it must be that sender.
+    // Exact on the trimmed value, which is what gets stored as from_agent. Only
+    // narrows: every guard below still runs, so the bound sender must also pass
+    // the SYSTEM_SENDER_IDS check like any other system sender. Urgent needs a
+    // FULL listed key (mayMarkUrgent), so a messages key is refused there too.
+    // messagesKeySender is null when the bound id has since become reserved.
+    if (ctx.auth?.kind === 'device' && ctx.auth.scope === 'messages' && from.trim() !== messagesKeySender(ctx.auth)) {
+      logger.warn({ from: from.trim(), to: to.trim(), deviceId: ctx.auth.deviceId }, 'Rejected /api/messages POST: messages key sending as another sender')
+      json(res, { error: 'a messages key may only send as the sender it is bound to' }, 403)
       return true
     }
     // Card 795d1f48 (a): an URGENT row is typed into a BUSY pane by the router (e.g. the save signal a key rotation
@@ -560,6 +573,9 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
   if (msgUpdateMatch && method === 'GET') {
     const one = getAgentMessage(parseInt(msgUpdateMatch[1], 10))
     if (!one) { json(res, { error: 'Message not found' }, 404); return true }
+    // cc-link: a messages key reads only rows its bound sender is on (the gate
+    // lets the path through; only the handler has the row).
+    if (!messagesKeyOwnsRow(ctx.auth, one)) { json(res, { error: 'Forbidden for this credential', reason: 'messages credential: not its own message' }, 403); return true }
     json(res, attachFreshness([one])[0])
     return true
   }
@@ -590,10 +606,33 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       }, 400)
       return true
     }
+    // cc-link: a messages key closes only rows its bound sender is on, checked
+    // BEFORE the status write. A missing row falls through to the 404 below.
+    const isMessagesKey = ctx.auth?.kind === 'device' && ctx.auth.scope === 'messages'
+    const target = isMessagesKey ? getAgentMessage(id) : undefined
+    if (target && !messagesKeyOwnsRow(ctx.auth, target)) {
+      json(res, { error: 'Forbidden for this credential', reason: 'messages credential: not its own message' }, 403)
+      return true
+    }
+    // ...and never earns the reverse [Eredmény] row, whatever the body says (Q
+    // re-review, M1). That row is written BY THE SERVER as from=<bound sender>
+    // to the delegator (typically the main agent), with a key-controlled result,
+    // and it skips every POST guard -- the SYSTEM_SENDER_IDS check included, so
+    // de-listing the sender would not have cut a stolen key off from the main
+    // agent. A laptop link closing its inbound row has nothing to report back.
+    const effectiveNotify = isMessagesKey ? false : notify
 
     let ok = false
     if (newStatus === 'done') ok = markMessageDone(id, result)
     else if (newStatus === 'failed') ok = markMessageFailed(id, result)
+    // A late real 'done' on a row the ROUTER failed for a delivery reason
+    // (abandon, inject give-up, delivery error) still lands, once, and then
+    // behaves exactly like a normal close below (span, notify rules, the
+    // messages-key no-notify rule). The cc-link laptop depends on it: rows to
+    // its system sender id have no session, so the router abandons every one,
+    // and the laptop claims them afterwards with PUT done. Any other terminal
+    // row falls through to the 409.
+    if (!ok && newStatus === 'done') ok = markRouterFailedMessageDone(id, result)
 
     if (ok) {
       const done = getAgentMessage(id)
@@ -607,7 +646,7 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
       // `notify: false` suppresses it; `notify: true` is only the default spelled out --
       // it does NOT override shouldNotifyDelegator, whose guards stop undeliverable and
       // ping-pong acks, not merely expensive ones.
-      if (done && notify !== false && shouldNotifyDelegator(done.from_agent, done.to_agent, done.content)) {
+      if (done && effectiveNotify !== false && shouldNotifyDelegator(done.from_agent, done.to_agent, done.content)) {
         // A vagas NE legyen nema, ES legyen KOVETHETO: lasd resultSummary().
         const summary = resultSummary(id, result)
         createAgentMessage(
@@ -617,6 +656,17 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
         )
       }
       json(res, { ok: true }); return true
+    }
+    // The closers are status-guarded (db.ts): a valid status that changed
+    // nothing on an EXISTING row means it was already done/failed. Say so with
+    // a 409 rather than the not-found 404, and send no notification -- the
+    // first close already did, and repeating it is exactly what the guard is for.
+    if (newStatus === 'done' || newStatus === 'failed') {
+      const existing = getAgentMessage(id)
+      if (existing) {
+        json(res, { error: 'Message already closed', status: existing.status }, 409)
+        return true
+      }
     }
     json(res, { error: 'Message not found or invalid status' }, 404)
     return true
