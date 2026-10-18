@@ -2327,7 +2327,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         // to the agent, no log, no retry). Surface it like the router does.
         logger.warn({ id: msg.id, rawFrom: msg.from_agent }, 'drain-inbox: message rejected, from_agent cannot be framed safely')
         if (!markMessageFailed(msg.id, 'Invalid or empty from_agent')) {
-          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (already closed concurrently, or deleted)')
         }
         continue
       }

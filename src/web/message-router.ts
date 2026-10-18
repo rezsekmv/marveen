@@ -42,6 +42,8 @@ import { classifyAgentMessage, isChannelInboundSender, wrapAgentMessageForDelive
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
 import { maybeWakeSubAgentsForTelegram } from './telegram-inbox-wake.js'
 import { isStopMessage, isUrgentDelivery, selectTickWindow } from './message-router-window.js'
+import { ROUTER_ABANDON_REASON, ROUTER_INJECT_GIVEUP_PREFIX, ROUTER_DELIVERY_ERROR_PREFIX, ROUTER_REFUSAL_PREFIX } from '../router-failure-reasons.js'
+import { PathTraversalError } from './sanitize.js'
 
 import { MESSAGE_ABANDON_WINDOW_MS } from './message-abandon.js'
 // How long a message must have waited before the stale-parked-input janitor is
@@ -160,7 +162,12 @@ function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckM
   }
 }
 
-function notifyOrchestratorOfFailedHandoff(msg: AgentMessage, reason: string): void {
+// `refused`: the row was a deliberate refusal (ROUTER_REFUSAL_PREFIX), not a
+// delivery fault. The main agent must still learn about it, but "could NOT be
+// delivered ... Consider re-sending" would be wrong advice: the same row would
+// be refused again. The [handoff-failure] tag stays, since the agents and the
+// docs key on it; only the wording changes.
+function notifyOrchestratorOfFailedHandoff(msg: AgentMessage, reason: string, opts: { refused?: boolean } = {}): void {
   try {
     // A failed message to the main agent can't happen (pull model), but guard
     // anyway so we never loop a notification back onto itself.
@@ -169,7 +176,9 @@ function notifyOrchestratorOfFailedHandoff(msg: AgentMessage, reason: string): v
     createAgentMessage(
       'system',
       MAIN_AGENT_ID,
-      `[handoff-failure] Inter-agent message (id ${msg.id}) ${msg.from_agent} -> ${msg.to_agent} could NOT be delivered: ${reason}. Consider re-sending or checking the target agent (full text: GET /api/messages/${msg.id}). Content preview: ${preview}`,
+      opts.refused
+        ? `[handoff-failure] Inter-agent message (id ${msg.id}) ${msg.from_agent} -> ${msg.to_agent} was REFUSED by the router (a deliberate refusal, not a delivery fault): ${reason}. Do not re-send it unchanged, it would be refused again; check the recipient id. Content preview: ${preview}`
+        : `[handoff-failure] Inter-agent message (id ${msg.id}) ${msg.from_agent} -> ${msg.to_agent} could NOT be delivered: ${reason}. Consider re-sending or checking the target agent (full text: GET /api/messages/${msg.id}). Content preview: ${preview}`,
     )
     logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, reason }, 'handoff-failure surfaced to orchestrator')
   } catch (err) {
@@ -216,18 +225,23 @@ export function shouldNotifySenderOfFailure(fromAgent: string, mainAgentId: stri
  *  It also names where the FULL text is (GET /api/messages/<id>): the preview stops at 220
  *  characters, and a sender re-sending a long handoff should not have to reconstruct it from
  *  memory or from its transcript. */
-export function formatSenderFailureNotice(msg: AgentMessage, reason: string): string {
+export function formatSenderFailureNotice(msg: AgentMessage, reason: string, opts: { refused?: boolean } = {}): string {
   const content = msg.content ?? ''
   const preview = content.length > 220 ? `${content.slice(0, 220)} [... +${content.length - 220} karakter]` : content
+  // A refusal is not a lost delivery: "küldd újra" would only be refused again.
+  if (opts.refused) {
+    return `[handoff-failure] A(z) ${msg.to_agent} címre küldött üzenetedet (#${msg.id}) a router SZÁNDÉKOSAN elutasította (nem kézbesítési hiba): ${reason}. ` +
+      `Változatlanul ne küldd újra, ugyanígy elutasítaná; ellenőrizd a címzett azonosítóját. Tartalom eleje: ${preview}`
+  }
   return `[handoff-failure] A(z) ${msg.to_agent} címre küldött üzeneted (#${msg.id}) NEM kézbesült: ${reason}. ` +
     `A visszakapott id a befogadást igazolta, nem a kézbesítést; ha még számít, küldd újra ` +
     `(a teljes szöveg: GET /api/messages/${msg.id}). Tartalom eleje: ${preview}`
 }
 
-function notifySenderOfFailedHandoff(msg: AgentMessage, reason: string): void {
+function notifySenderOfFailedHandoff(msg: AgentMessage, reason: string, opts: { refused?: boolean } = {}): void {
   try {
     if (!shouldNotifySenderOfFailure(msg.from_agent, MAIN_AGENT_ID)) return
-    createAgentMessage('system', msg.from_agent, formatSenderFailureNotice(msg, reason))
+    createAgentMessage('system', msg.from_agent, formatSenderFailureNotice(msg, reason, opts))
     logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent, reason }, 'handoff-failure surfaced to sender')
   } catch (err) {
     logger.warn({ err, id: msg.id }, 'Failed to enqueue handoff-failure notification to sender')
@@ -972,11 +986,15 @@ export async function runMessageRouterTick(): Promise<void> {
       const absentForMs = continuousAbsenceMs(msg.to_agent, sessionExists, now)
       if (!worksourceServing && shouldAbandon(sessionExists, absentForMs, MESSAGE_ABANDON_WINDOW_MS)) {
         logger.warn({ id: msg.id, from: msg.from_agent, to: msg.to_agent, ageMs, absentForMs }, 'Agent message abandoned: target session absent for full retry window')
-        const closed = markMessageFailed(msg.id, 'Abandoned: target session absent for full retry window')
+        const closed = markMessageFailed(msg.id, ROUTER_ABANDON_REASON, { by: 'router' })
         if (!closed) {
-          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (already closed concurrently, e.g. a PUT done, or deleted)')
         }
-        notifyOrchestratorOfFailedHandoff(msg, 'target session was absent for the entire retry window')
+        // Gated on `closed` like the delivery-error branch: since the closers are
+        // status-guarded, false most often means someone closed the row first
+        // (the recipient's PUT done), and telling the main agent it "could NOT
+        // be delivered" would then be false.
+        if (closed) notifyOrchestratorOfFailedHandoff(msg, 'target session was absent for the entire retry window')
         // Only the row this call closed earns a sender notice: a row closed concurrently
         // was not failed by us, and must not be reported as failed.
         if (closed) notifySenderOfFailedHandoff(msg, 'a címzett munkamenete a teljes türelmi ablakban (60 perc) folyamatosan hiányzott')
@@ -1138,7 +1156,7 @@ export async function runMessageRouterTick(): Promise<void> {
       if (!cls) {
         logger.warn({ id: msg.id, rawFrom: msg.from_agent }, 'Agent message rejected: from_agent empty after sanitize')
         if (!markMessageFailed(msg.id, 'Invalid or empty from_agent')) {
-          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (already closed concurrently, or deleted)')
         }
         routerLoggedMisses.delete(msg.id)
         continue
@@ -1351,23 +1369,34 @@ export async function runMessageRouterTick(): Promise<void> {
           continue
         }
         logger.error({ err, id: msg.id, failCount }, 'Failed to inject agent message after retries, giving up')
-        const closed = markMessageFailed(msg.id, `Failed to inject into tmux session after ${failCount} attempts`)
+        const closed = markMessageFailed(msg.id, `${ROUTER_INJECT_GIVEUP_PREFIX}${failCount} attempts`, { by: 'router' })
         if (!closed) {
-          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (already closed concurrently, e.g. a PUT done, or deleted)')
         }
-        notifyOrchestratorOfFailedHandoff(msg, `tmux inject failed ${failCount}x`)
+        // Gated on `closed`: see the abandon branch above.
+        if (closed) notifyOrchestratorOfFailedHandoff(msg, `tmux inject failed ${failCount}x`)
         if (closed) notifySenderOfFailedHandoff(msg, `a címzett paneljébe írás ${failCount}-szer elbukott`)
         routerInjectFailures.delete(msg.id)
         routerLoggedMisses.delete(msg.id)
       }
       } catch (err) {
         logger.warn({ err, id: msg.id, to: msg.to_agent }, 'Agent message processing threw; marking failed so the queue cannot wedge')
-        const closed = markMessageFailed(msg.id, `Delivery error: ${String(err).slice(0, 200)}`)
+        // A deliberate refusal (path-traversal to_agent) is poison by
+        // construction: closed under 'Refused: ' and WITHOUT router provenance,
+        // so a later PUT done can never reopen it. Anything else is an accident
+        // of delivery and stays a reopenable 'Delivery error: '.
+        const refused = err instanceof PathTraversalError
+        const closed = refused
+          ? markMessageFailed(msg.id, `${ROUTER_REFUSAL_PREFIX}${String(err).slice(0, 200)}`)
+          : markMessageFailed(msg.id, `${ROUTER_DELIVERY_ERROR_PREFIX}${String(err).slice(0, 200)}`, { by: 'router' })
         if (!closed) {
-          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (already closed concurrently, e.g. a PUT done, or deleted)')
         }
         // Card 71263d15 (A): this branch used to fail the row silently, telling nobody.
-        if (closed) {
+        if (closed && refused) {
+          notifyOrchestratorOfFailedHandoff(msg, String(err).slice(0, 200), { refused: true })
+          notifySenderOfFailedHandoff(msg, 'a címzett azonosítója nem biztonságos (útvonal-ellenőrzés)', { refused: true })
+        } else if (closed) {
           notifyOrchestratorOfFailedHandoff(msg, `delivery error: ${String(err).slice(0, 200)}`)
           notifySenderOfFailedHandoff(msg, 'kézbesítési hiba a routerben')
         }

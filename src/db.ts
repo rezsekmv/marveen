@@ -9,6 +9,7 @@ import { TOOL_TIMEOUTS } from './tool-timeouts.js'
 import { triggerLikeClause } from './homoglyph.js'
 import type { LiveKanban } from './web/heartbeat-kanban-verify.js'
 import { compareDeliveryOrder, deliveryRankSql } from './delivery-order.js'
+import { ROUTER_RECOVERABLE_FAILURES } from './router-failure-reasons.js'
 
 let db: Database.Database
 // The path the CURRENT handle was opened on (null for ':memory:'). Kept so
@@ -944,6 +945,17 @@ export function initDatabase(dbPathOverride?: string): void {
   // sets it; POST /api/messages never does, so a 1 here is authenticated by construction.
   // 0 for every older row.
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN stop_authorized INTEGER NOT NULL DEFAULT 0') } catch { /* exists */ }
+  // cc-link (CodeRabbit on the late-done round): WHO closed a row as failed.
+  // 'router' = the message router's own delivery-failure close (abandon, inject
+  // give-up, delivery error), set only in-process via markMessageFailed's `by`;
+  // PUT /api/messages/<id> never sets it, so 'router' is authenticated by
+  // construction, the same way urgent/stop_authorized are. It is what lets
+  // markRouterFailedMessageDone reopen a row: the result TEXT alone is not
+  // provenance, since any PUT caller can write "Delivery error: x" as a result.
+  // NULL for every older row and for every non-router failure, so a row failed
+  // before this column existed is NOT reopenable (deliberately: its origin
+  // cannot be proven).
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN failed_by TEXT') } catch { /* exists */ }
 
   // INVARIANT: a row that says 'delivered' must carry a delivered_at.
   //
@@ -1522,6 +1534,10 @@ export function initDatabase(dbPathOverride?: string): void {
   // DASHOPERATOR1005: what a key may reach. 'full' = every existing key and the
   // default, so this column changes nothing until an 'operator' key is minted.
   try { db.exec(`ALTER TABLE device_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'`) } catch { /* column already exists */ }
+  // cc-link: the ONE sender id a 'messages' scoped key may act as on the message
+  // API. Null for every other scope (and every key minted before this column),
+  // so existing rows read exactly as before.
+  try { db.exec(`ALTER TABLE device_keys ADD COLUMN sender_id TEXT`) } catch { /* column already exists */ }
 
   // --- OTel Distributed Tracing (card def5a189) ---
   // SQLite-native span store. No external OTel SDK: spans are written via
@@ -3819,6 +3835,8 @@ export interface AgentMessage {
   // Card 795d1f48 (a): 1 = an authenticated urgent row (see the migration). Optional in the type only because rows built
   // in code before the column (tests, fixtures) do not carry it; every row read from the table has it.
   urgent?: number
+  /** 'router' when the router closed the row as failed (see the migration); null otherwise. */
+  failed_by?: string | null
   // Card 71263d15 (C): 1 = a STOP from an authenticated writer (see the migration). Optional in the type
   // only because rows built in code before the column (tests, fixtures) do not carry it.
   stop_authorized?: number
@@ -4183,25 +4201,70 @@ export function claimPendingForAgent(toAgent: string, limit: number): AgentMessa
   return rows.sort(compareDeliveryOrder)
 }
 
+// Both closers are STATUS-GUARDED: they close only a row that is still open
+// (pending or delivered) and return false on a done/failed row, leaving it
+// exactly as it was. First closer wins. (One narrow exception, failed -> done
+// on a row the router failed for a delivery reason: markRouterFailedMessageDone.)
+//
+// Why (Q re-review of cc-link, M1): unguarded, the same row could be closed
+// again and again, and every PUT close wrote a fresh [Eredmény] row to the
+// delegator -- so one credential could repeat a server-written message to the
+// main agent at will. The same race also let the router's abandon branch flip
+// a row an agent had already closed as done into 'failed' (and send a false
+// failure notice). Every caller was audited when the guard went in: none
+// intentionally re-closes a terminal row (router abandon / inject failure /
+// invalid from / delivery error, backlog batching, system-directive anchor,
+// drain-inbox invalid from, voice mailbox, PUT /api/messages/<id>), so there
+// is no unguarded variant. The callers already treat false as "not closed by
+// me" (no sender notice, a log line).
 export function markMessageDone(id: number, result?: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   // COALESCE: some done-transitions skip the delivered step entirely (e.g. a
   // still-pending row marked done directly via PUT), so backfill delivered_at
   // only when it was never set -- don't clobber a real earlier delivery time.
-  return db.prepare("UPDATE agent_messages SET status = 'done', result = ?, completed_at = ?, delivered_at = COALESCE(delivered_at, ?) WHERE id = ?").run(result ?? null, now, now, id).changes > 0
+  return db.prepare("UPDATE agent_messages SET status = 'done', result = ?, completed_at = ?, delivered_at = COALESCE(delivered_at, ?) WHERE id = ? AND status IN ('pending', 'delivered')").run(result ?? null, now, now, id).changes > 0
 }
 
-export function markMessageFailed(id: number, error?: string): boolean {
+// `by: 'router'` is for the message router's delivery-failure closes ONLY
+// (failed_by migration); every other caller omits it and leaves failed_by NULL.
+export function markMessageFailed(id: number, error?: string, opts: { by?: 'router' } = {}): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare("UPDATE agent_messages SET status = 'failed', result = ?, completed_at = ? WHERE id = ?").run(error ?? null, now, id).changes > 0
+  return db.prepare("UPDATE agent_messages SET status = 'failed', result = ?, completed_at = ?, failed_by = ? WHERE id = ? AND status IN ('pending', 'delivered')").run(error ?? null, now, opts.by ?? null, id).changes > 0
+}
+
+// The ONE exception to the guard above: failed -> done (never failed -> failed,
+// never done -> anything), and only on a row the ROUTER failed with one of its
+// delivery-failure reasons (router-failure-reasons.ts says which, and why each
+// is a guess that can be wrong). Both must hold: failed_by = 'router' is the
+// provenance (a PUT caller can write any result text, never failed_by), and
+// the reason match keeps 'Invalid or empty from_agent' -- also a router close,
+// but a refusal -- final. A row closed by a person, an agent, a refusal
+// or a directive stays final. One statement, so the check and the write cannot
+// be split by a concurrent close; prefixes compare with substr, not LIKE, so a
+// '%' or '_' in a reason is never a wildcard. delivered_at is backfilled like
+// markMessageDone (an abandoned row never had one). failed_by is cleared in
+// the same statement: a done row must not keep looking router-failed.
+const ROUTER_FAILED_MATCH_SQL = ROUTER_RECOVERABLE_FAILURES
+  .map(f => (f.match === 'exact' ? 'result = ?' : 'substr(result, 1, ?) = ?'))
+  .join(' OR ')
+const ROUTER_FAILED_MATCH_ARGS: Array<string | number> = ROUTER_RECOVERABLE_FAILURES
+  .flatMap(f => (f.match === 'exact' ? [f.text] : [f.text.length, f.text]))
+
+export function markRouterFailedMessageDone(id: number, result?: string): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare(
+    `UPDATE agent_messages SET status = 'done', result = ?, completed_at = ?, delivered_at = COALESCE(delivered_at, ?), failed_by = NULL
+       WHERE id = ? AND status = 'failed' AND failed_by = 'router' AND (${ROUTER_FAILED_MATCH_SQL})`,
+  ).run(result ?? null, now, now, id, ...ROUTER_FAILED_MATCH_ARGS).changes > 0
 }
 
 // Close a message that is still OPEN (pending or delivered), atomically: the
 // status check and the write are one UPDATE, so of two concurrent closes only
 // one changes the row. Used by the PUT /api/messages/:id route, where a second
 // close of an already-closed row used to overwrite its result and send a
-// second completion report in the recipient's name. The router keeps the
-// unguarded markMessageDone/markMessageFailed above for its own transitions.
+// second completion report in the recipient's name. markMessageDone /
+// markMessageFailed above are status-guarded too (cc-link); this one is the
+// PUT route's single entry point.
 export function closeOpenMessage(id: number, status: 'done' | 'failed', result?: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   const sql = status === 'done'
@@ -4213,11 +4276,10 @@ export function closeOpenMessage(id: number, status: 'done' | 'failed', result?:
 
 // Status-guarded fail for the federation bridge's terminal branches: it must
 // only fire (and only bounce a failure notice) when THIS call actually closed
-// a still-pending row. The unguarded markMessageFailed above would also
-// "succeed" on a row a concurrent disable/removal purge already failed
-// (result/completed_at change -> changes>0), producing a spurious second
-// notice. The drain-inbox path deliberately keeps the unguarded variant (it
-// fails an already-delivered row).
+// a still-pending row. markMessageFailed above is guarded against terminal
+// rows only (it also closes a 'delivered' one, which the drain-inbox path
+// needs); this one is narrower still: pending only, so a row the bridge
+// already handed over is never failed from here.
 export function markPendingFederatedFailed(id: number, error: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare("UPDATE agent_messages SET status = 'failed', result = ?, completed_at = ? WHERE id = ? AND status = 'pending'").run(error, now, id).changes > 0

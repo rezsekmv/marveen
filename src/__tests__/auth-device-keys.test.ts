@@ -129,6 +129,7 @@ describe('mint + storage discipline', () => {
       expiresAt: null,
       installId: null,
       scope: 'full',
+      senderId: null,
     })
   })
 })

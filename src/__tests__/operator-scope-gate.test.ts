@@ -214,11 +214,13 @@ describe('the owner switches', () => {
     expect(row.actor).toBe('session:owner')
   })
 
-  it('an unexpected stored scope reads as operator (fail closed), only the literal full is full', () => {
+  it('an unexpected stored scope denies the key outright (fail closed), only the literal full is full', () => {
+    // Was "reads as operator" until the cc-link re-review: unknown -> operator is
+    // the rollback hazard (an older build reads a 'messages' key as operator).
     const k = createDeviceKey('odd')
     getDb().prepare("UPDATE device_keys SET scope = 'FULL' WHERE id = ?").run(k.id)
     _clearDeviceKeyCacheForTest()
-    expect(resolveDeviceKey(k.key)?.scope).toBe('operator')
+    expect(resolveDeviceKey(k.key)).toBeNull()
   })
 
   it('GET/PUT /api/operator-access is owner-only: device keys (full or operator) get 403', async () => {
