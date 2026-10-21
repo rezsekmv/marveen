@@ -1,5 +1,5 @@
 """Self-check for sync.py's pure helpers: python3 test_sync.py"""
-import json, os, sys, tempfile
+import json, os, sys, tempfile, time
 
 os.environ['CC_LINK_SYNC_DIR'] = tempfile.mkdtemp()
 os.environ['CC_LINK_SYNC_CATEGORIES'] = 'WORK=/w,HOME=/h/'  # trailing slash is normalized
@@ -67,21 +67,69 @@ stream = '\n'.join([
 ])
 assert sync.parse_stream(stream) == (['42'], 'Sent!')
 assert sync.parse_stream('') == ([], '')
-queued = json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'queued in outbox (timeout), will retry.'}]}})
-assert sync.parse_stream(queued) == (['queued'], '')
+def result(text):
+    return json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': text}]}})
+
+
+# every message-tool result form (MCP server link.ts) that means the message went out
+for text, want in [('queued in outbox (timeout), will retry.', 'queued'),
+                   ('sent (id 7). An answer, if the main agent writes one, ...', '7'),
+                   ('sent (id 8), but reading it back failed (HTTP 500): x', '8'),
+                   ('answer (id 9):\n\nok', '9'),
+                   ('message 10 was read and closed without an answer', '10'),
+                   ('message failed (id 11):\n\nx', '11'),
+                   ('Nincs még válasz (id 12). Később érkezik ...', '12')]:
+    assert sync.parse_stream(result(text)) == ([want], ''), text
+assert sync.parse_stream(result('error: text must be a string')) == ([], '')
 assert sync.has_line('x\n SKIP \n', 'SKIP') and sync.has_line('`SKIP`.', 'SKIP') and sync.has_line('**NOOP**', 'NOOP')
-assert not sync.has_line('I will not SKIP this', 'SKIP')
+assert sync.has_line('SKIP: nothing new', 'SKIP')
+assert not sync.has_line('I will not SKIP this', 'SKIP') and not sync.has_line('SKIPPED', 'SKIP')
 
 # the lockdown check accepts only cc-link tools and servers
-sync.check_lockdown({'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}]})
+sync.check_lockdown({'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}],
+                     'plugins': [{'name': 'cc-plugin-telemetry', 'path': 'builtin'}]})
 for bad in ({'tools': ['Bash', 'mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}]},
             {'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}, {'name': 'other'}]},
-            {'tools': [], 'mcp_servers': [{'name': 'cc-link'}]}):
+            {'tools': [], 'mcp_servers': [{'name': 'cc-link'}]},
+            {'tools': [{'name': 'Bash'}], 'mcp_servers': [{'name': 'cc-link'}]},
+            {'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': ['cc-link']},
+            {'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}],
+             'plugins': [{'name': 'x', 'path': '/some/user/plugin'}]},
+            {'mcp_servers': [{'name': 'cc-link'}]}):
     try:
         sync.check_lockdown(bad)
         raise AssertionError(bad)
     except RuntimeError:
         pass
+
+# claude(): the child is killed as soon as the stream shows anything but a clean cc-link init
+fake_bin = tempfile.mkdtemp()
+with open(f'{fake_bin}/claude', 'w') as fh:
+    fh.write('#!/bin/sh\ncat > /dev/null\nprintf "%s\\n" "$FAKE_EVENT"\nsleep "${FAKE_SLEEP:-30}"\n')
+os.chmod(f'{fake_bin}/claude', 0o755)
+os.environ['PATH'] = fake_bin + os.pathsep + os.environ['PATH']
+os.makedirs(sync.RUN_DIR, exist_ok=True)
+for event in ['{"type":"system","subtype":"init","tools":["Bash"],"mcp_servers":[{"name":"cc-link"}]}',
+              '{"type":"system","subtype":"init","tools":"Bash","mcp_servers":[]}',
+              '{"type":"assistant","message":{}}',
+              '{"type":"system","subtype":"hook_started"}',
+              'not json',
+              '[]']:
+    os.environ['FAKE_EVENT'] = event
+    started = time.time()
+    try:
+        sync.claude('prompt', 'haiku', 'mcp__cc-link__agent_message')
+        raise AssertionError(f'not rejected: {event}')
+    except (RuntimeError, ValueError):
+        pass
+    assert time.time() - started < 10, f'child not killed promptly: {event}'
+os.environ['FAKE_EVENT'] = '{"type":"system","subtype":"status"}'
+os.environ['FAKE_SLEEP'] = '0'
+try:  # stream ends without an init event
+    sync.claude('prompt', 'haiku', 'mcp__cc-link__agent_message')
+    raise AssertionError('missing init not rejected')
+except RuntimeError:
+    pass
 
 # folder key matches the MCP server's identity.ts (sha256 of the realpath, 8 hex chars)
 assert sync.folder_key('/') == '8a5edab2'

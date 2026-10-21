@@ -31,7 +31,7 @@ Configuration (environment):
 The dashboard URL and device key are read from the cc-link entry in
 ~/.claude.json (user-scope registration), never from this script's env.
 """
-import fcntl, glob, hashlib, json, os, re, subprocess, sys, threading, time, urllib.request
+import fcntl, glob, hashlib, json, os, re, signal, subprocess, sys, threading, time, urllib.request
 from datetime import datetime
 
 HOME = os.path.expanduser('~')
@@ -144,9 +144,21 @@ def brief(name):
 def write_mcp_config():
     entry = json.load(open(f'{HOME}/.claude.json'))['mcpServers']['cc-link']
     tmp = f'{MCP_CONFIG}.{os.getpid()}'
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as fh:
-        json.dump({'mcpServers': {'cc-link': entry}}, fh)
-    os.replace(tmp, MCP_CONFIG)  # a fresh 0600 file, whatever mode an older one had
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as fh:
+            json.dump({'mcpServers': {'cc-link': entry}}, fh)
+        os.replace(tmp, MCP_CONFIG)  # a fresh 0600 file, whatever mode an older one had
+    finally:
+        remove_mcp_config(temp_only=True)
+
+
+def remove_mcp_config(temp_only=False):
+    """mcp.json holds the device key: never leave it (or a temp copy) on disk after a run."""
+    for path in glob.glob(f'{MCP_CONFIG}.*') + ([] if temp_only else [MCP_CONFIG]):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def parse_stream(out):
@@ -162,8 +174,12 @@ def parse_stream(out):
                 if isinstance(b, dict) and b.get('type') == 'tool_result':
                     c = b.get('content')
                     c = c if isinstance(c, str) else ' '.join(x.get('text', '') for x in c or [])
-                    ids += re.findall(r'^(?:sent|answer) \(id (\d+)\)', c)
-                    if c.startswith('queued in outbox'):  # the MCP server sends it later: as good as sent
+                    # every message-tool result that carries an id means the message went out, whatever
+                    # happened next (wait=true: answer, closed, failed, no answer yet)
+                    m = re.search(r'\(id (\d+)\)|^message (\d+) was read', c)
+                    if m:
+                        ids.append(m.group(1) or m.group(2))
+                    elif c.startswith('queued in outbox'):  # the MCP server sends it later: as good as sent
                         ids.append('queued')
         elif ev.get('type') == 'result':
             text = ev.get('result') or ''
@@ -171,11 +187,20 @@ def parse_stream(out):
 
 
 def check_lockdown(ev):
-    """The init event must show only cc-link: the lockdown depends on CLI flags, so verify it on every run."""
-    tools = ev.get('tools') or []
-    servers = [m.get('name') for m in ev.get('mcp_servers') or []]
-    if not tools or any(not t.startswith('mcp__cc-link__') for t in tools) or servers != ['cc-link']:
-        raise RuntimeError(f'lockdown not in effect (tools={tools}, mcp={servers})')
+    """The init event must show only cc-link: the lockdown depends on CLI flags, so verify it on every run.
+
+    Checks tools, MCP servers and plugins (only Claude Code's built-in ones, which add no tools under
+    --tools ""). Hooks are not listed in the init event; they are kept out by --setting-sources "" and
+    any hook event before init fails the run.
+    """
+    tools, servers, plugins = ev.get('tools'), ev.get('mcp_servers'), ev.get('plugins') or []
+    if not isinstance(tools, list) or not isinstance(servers, list) or not isinstance(plugins, list) \
+            or not all(isinstance(x, str) for x in tools) or not all(isinstance(x, dict) for x in servers + plugins):
+        raise RuntimeError('lockdown check: unexpected init event shape')
+    names = [m.get('name') for m in servers]
+    foreign = [x.get('name') for x in plugins if x.get('path') != 'builtin']
+    if not tools or any(not t.startswith('mcp__cc-link__') for t in tools) or names != ['cc-link'] or foreign:
+        raise RuntimeError(f'lockdown not in effect (tools={tools}, mcp={names}, plugins={foreign})')
 
 
 def claude(prompt, model, tool):
@@ -190,38 +215,49 @@ def claude(prompt, model, tool):
                           '--output-format', 'stream-json', '--verbose'],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          cwd=RUN_DIR, env={**os.environ, 'TELEGRAM_STATE_DIR': EMPTY_DIR})
+    def feed():
+        try:
+            p.stdin.write(prompt)
+            p.stdin.close()
+        except OSError:  # BrokenPipeError: the child exited or was killed
+            pass
+
     err = []
-    threading.Thread(target=lambda: (p.stdin.write(prompt), p.stdin.close()), daemon=True).start()
-    threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()
+    writer = threading.Thread(target=feed, daemon=True)
+    reader = threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True)
+    writer.start()
+    reader.start()
     timer = threading.Timer(TIMEOUT_SEC, p.kill)
     timer.start()
     out, checked = [], False
     try:
         for line in p.stdout:
             out.append(line)
-            if not checked:
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get('type') != 'system':  # fail closed: nothing may happen before the init check
-                    raise RuntimeError(f'no init event before {ev.get("type")}')
-                if ev.get('subtype') == 'init':
-                    check_lockdown(ev)
-                    checked = True
-    except RuntimeError:
+            if checked:
+                continue
+            # fail closed: until the init event passed the check, anything unexpected kills the child
+            ev = json.loads(line)
+            if not isinstance(ev, dict) or ev.get('type') != 'system' or str(ev.get('subtype', '')).startswith('hook'):
+                raise RuntimeError(f'unexpected event before init: {line[:120]}')
+            if ev.get('subtype') == 'init':
+                check_lockdown(ev)
+                checked = True
+        if not checked:
+            raise RuntimeError('no init event')
+    except BaseException:
         p.kill()
         raise
     finally:
         p.wait()
         timer.cancel()
+        reader.join(5)
     ids, text = parse_stream(''.join(out))
     return ids, text, p.returncode, ''.join(err)[-300:]
 
 
 def has_line(text, word):
-    """`word` alone on a line, ignoring markdown and punctuation around it."""
-    return any(re.sub(r'[^A-Za-z]', '', line) == word for line in text.splitlines())
+    """A line that starts with `word`, ignoring markdown around it (`SKIP`, **NOOP**, SKIP: reason)."""
+    return any(re.match(rf'[\W_]*{word}\b', line) for line in text.splitlines())
 
 
 def server_env():
@@ -271,7 +307,7 @@ def sync_session(f, done, now, dry):
     if dry:
         print(f'would send {sid[:8]} {cat} lines {start}-{len(lines)} chars={len(text)}')
         return
-    row = summarize(sid, cat, cwd, (ts or '')[:10], text, was_sent) if text.strip() else ('skipped', '-')
+    row = summarize(sid, cat, cwd, (ts or '')[:10], text, was_sent and handled > 0) if text.strip() else ('skipped', '-')
     with open(LOG, 'a') as fh:
         fh.write('\t'.join([sid, time.strftime('%Y-%m-%d'), cat, row[0], row[1], str(len(lines))]) + '\n')
     print(f'{time.strftime("%F %T")} {sid[:8]} {cat} {row[0]} {row[1]}')
@@ -346,7 +382,8 @@ def project_dir_name(path):
 
 
 def secure_state():
-    """0700 dirs, 0600 files, also for ones created earlier or by launchd (sync.log)."""
+    """0700 dirs, 0600 files, also for ones created earlier or by launchd (sync.log); no stale mcp.json."""
+    remove_mcp_config()
     for d in (SYNC, RUN_DIR, EMPTY_DIR):
         os.makedirs(d, mode=0o700, exist_ok=True)
         os.chmod(d, 0o700)
@@ -374,10 +411,15 @@ def main(dry):
         except Exception as e:
             print(f'answer step failed: {e}', file=sys.stderr)
     finally:
-        os.remove(MCP_CONFIG)  # the device key does not stay on disk outside ~/.claude.json
+        remove_mcp_config()  # the device key does not stay on disk outside ~/.claude.json
+
+
+def on_sigterm(signum, frame):
+    raise SystemExit(f'stopped by signal {signum}')  # runs the finally blocks: child killed, mcp.json removed
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, on_sigterm)
     os.umask(0o077)  # state, log and mcp.json are private
     os.makedirs(SYNC, mode=0o700, exist_ok=True)
     lock = open(f'{SYNC}/sync.lock', 'w')

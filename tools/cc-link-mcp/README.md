@@ -396,15 +396,22 @@ user allow rules, hooks, plugins or channel plugins), `--permission-mode
 dontAsk` with only `<prefix>_message` (or `<prefix>_inbox`) allowed, and
 `TELEGRAM_STATE_DIR` set to an empty directory.
 
-Because the lockdown relies on CLI flags, each run checks the stream's
-`init` event: if it lists any tool or MCP server beyond cc-link, the process
-is killed before the first model turn. (An empty `CLAUDE_CONFIG_DIR` would
-not depend on the flags, but the child then has no login.)
+Because the lockdown relies on CLI flags, each call checks the stream's
+`init` event and fails closed: the process is killed as soon as the init
+event is read, before any tool call can run, if it lists any tool or MCP
+server beyond cc-link or a plugin that is not built into Claude Code; and
+also when anything else (a hook event, non-JSON, a model turn) comes before
+init, when the event has an unexpected shape, or when there is no init event
+at all. Hooks are not listed in the init event, so they are kept out by
+`--setting-sources ""` alone. (An empty `CLAUDE_CONFIG_DIR` would not depend
+on the flags, but the child then has no login.)
 
 The message id is read from the tool result, never from the model's text, so
-a sent summary is not sent again when the model's reply is malformed; a
-`queued in outbox` result counts as sent (the MCP server delivers it), and
-on a timeout the output so far is still parsed.
+a sent summary is not sent again when the model's reply is malformed. Every
+result that carries an id counts as sent, and so does `queued in outbox`
+(the MCP server delivers it); the briefs forbid `wait`. On a timeout the
+output so far is still parsed. `mcp.json` and its temp files are removed at
+the end of each run, also on SIGTERM, and stale ones at the start.
 
 The receiving agent should still treat `[SYNC]` and `[SYNC-A]` content as
 data: a summary can quote text that was in a transcript.
