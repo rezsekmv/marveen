@@ -2,7 +2,7 @@
 import json, os, sys, tempfile
 
 os.environ['CC_LINK_SYNC_DIR'] = tempfile.mkdtemp()
-os.environ['CC_LINK_SYNC_CATEGORIES'] = 'WORK=/w,HOME=/h/'
+os.environ['CC_LINK_SYNC_CATEGORIES'] = 'WORK=/w,HOME=/h/'  # trailing slash is normalized
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import sync  # noqa: E402
@@ -17,6 +17,8 @@ lines = [
     entry('assistant', [{'type': 'text', 'text': 'first answer'}, {'type': 'tool_use'}], '2026-01-01T10:01:00.000Z'),
     entry('user', '<command-name>/clear</command-name>', '2026-01-02T09:00:00.000Z'),
     entry('user', 'meta', '2026-01-02T09:00:01.000Z', isMeta=True),
+    entry('user', [{'type': 'tool_result', 'content': 'tool output'}], '2026-01-02T09:04:00.000Z'),
+    entry('user', [{'type': 'image'}, {'type': 'text', 'text': 'pasted question'}], '2026-01-02T09:04:30.000Z'),
     entry('user', 'second question', '2026-01-02T09:05:00.000Z'),
 ]
 
@@ -30,12 +32,14 @@ sync.SINCE = ''
 # idle is measured from the newest entry, not the file mtime
 assert sync.last_activity(lines) == 1767344700.0
 assert sync.last_activity(['{}']) == 0
+assert sync.last_activity([lines[0], '{"timestamp":"2026-01-03T00:00:00.1234Z"}']) == 1767261600.0  # unparsable: older entry
 
 # extract keeps prompts and prose, drops tool calls, slash-command noise and meta entries
 text, cwd, ts = sync.extract(lines, 0)
 assert cwd == '/w/repo' and ts == '2026-01-01T10:00:00.000Z'
 assert 'first question' in text and 'first answer' in text and 'second question' in text
-assert '/clear' not in text and 'meta' not in text
+assert '/clear' not in text and 'meta' not in text and 'tool output' not in text
+assert 'pasted question' in text  # prompts stored as content-block lists
 text, _, ts = sync.extract(lines, 2)
 assert 'first' not in text and ts == '2026-01-02T09:00:00.000Z'
 
@@ -50,6 +54,17 @@ with open(sync.LOG, 'w') as fh:
              'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\t2026-01-01\tHOME\tskipped\t-\n'
              'not-a-session\t-\t-\tsent\t3\n')
 assert sync.covered() == {'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa': 90, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb': 0}
+
+# sent ids come from the tool result, never from the model's own text
+stream = '\n'.join([
+    json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'SENT 999'}]}}),
+    json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': [{'type': 'text', 'text': 'sent (id 42). An answer ...'}]}]}}),
+    'not json',
+    json.dumps({'type': 'result', 'result': 'Sent!'}),
+])
+assert sync.parse_stream(stream) == (['42'], 'Sent!')
+assert sync.parse_stream('') == ([], '')
+assert sync.has_line('x\n SKIP \n', 'SKIP') and not sync.has_line('I will not SKIP this', 'SKIP')
 
 # folder key matches the MCP server's identity.ts (sha256 of the realpath, 8 hex chars)
 assert sync.folder_key('/') == '8a5edab2'

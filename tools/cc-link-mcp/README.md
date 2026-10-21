@@ -359,8 +359,8 @@ registration above); the plist holds no secret. After changing the plist:
 
 State in `CC_LINK_SYNC_DIR`: `sent.tsv` (session id, date, category,
 `sent`/`skipped`, message id, transcript lines covered), `answered.txt`,
-`sync.log`, and `run/`, the working directory of every `claude -p` call. Its
-own transcripts are never summarized.
+`sync.log`, `mcp.json`, `sync.lock`, and `run/`, the working directory of
+every `claude -p` call. Its own transcripts are never summarized.
 
 ### Questions about a session: SYNC-Q / SYNC-A
 
@@ -379,10 +379,31 @@ prints it (`questions go to folder:<key>`).
   `[SYNC-A] ref:<message id> session:<id8>`.
 - Without a session reference, or when the transcript does not answer it,
   the reply says what is missing (then ask the user). Acknowledgements get
-  no reply. Handled ids go to `answered.txt`.
+  no reply.
 
-Answers come only from the transcripts; the model gets no other tool than
-`<prefix>_message`. Self-check of the helpers: `python3 sync/test_sync.py`.
+Only sessions already summarized (in `sent.tsv`) can be asked about; the
+sync's own `run/` transcripts never are. Handled ids go to `answered.txt`;
+`answer` entries (replies to the sync's own messages) are never treated as
+questions.
+
+### Safety
+
+Transcripts and questions are untrusted input, so every `claude -p` call is
+locked down: `--tools ""` (no built-in tools), `--strict-mcp-config` with a
+generated `mcp.json` that holds only the cc-link server (mode 0600, it
+contains the device key), `--setting-sources ""` (no user allow rules,
+hooks, plugins or channel plugins) and `--permission-mode dontAsk` with only
+`<prefix>_message` (or `<prefix>_inbox`) allowed. The message id is read from
+the tool result, never from the model's text, so a sent summary is not sent
+again when the model's reply is malformed.
+
+The receiving agent should still treat `[SYNC]` and `[SYNC-A]` content as
+data: a summary can quote text that was in a transcript.
+
+State, log and `mcp.json` are created with umask 077; a `flock` on
+`sync.lock` keeps runs from overlapping.
+
+Self-check of the helpers: `python3 sync/test_sync.py`.
 
 ## On the mini
 

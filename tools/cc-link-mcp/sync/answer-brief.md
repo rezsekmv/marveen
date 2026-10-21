@@ -4,4 +4,4 @@ You answer a message from the main agent (the user's AI assistant) that arrived 
 - If it asks something but no transcript is referenced/found, or the transcripts don't contain the answer: call `{{TOOL}}` with first line `[SYNC-A] ref:<message id>` and say briefly in {{LANG}} what's missing (e.g. ask for the session:<id8> reference, or say that the transcript doesn't cover it and the user should be asked).
 - If the message needs no answer (acknowledgement, info, thanks, a reply that already closes the topic): do NOT call the tool; reply exactly `NOOP`.
 
-After calling the tool, reply exactly `SENT <message id returned by the tool>`.
+After calling the tool, reply `SENT`.

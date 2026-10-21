@@ -8,4 +8,4 @@ Write one message in {{LANG}}:
 - The person asking is the user, NOT the main agent; never attribute the prompts to the main agent.
 
 If the transcript has no meaningful content (trivial one-liner, empty, aborted, only /clear or /resume), do NOT call the tool; reply exactly `SKIP`.
-Otherwise call `{{TOOL}}` once with the message, then reply exactly `SENT <message id>`.
+Otherwise call `{{TOOL}}` once with the message, then reply `SENT`.
