@@ -331,7 +331,7 @@ from the LAN), the run exits before calling any model; the next run catches up.
 ### Install
 
 ```bash
-mkdir -p ~/.cc-link/sync
+mkdir -p -m 700 ~/.cc-link/sync
 sed -e "s#__HOME__#$HOME#g" \
     -e "s#__SYNC_PY__#$PWD/sync/sync.py#" \
     -e "s#__AGENT_NAME__#<your CC_LINK_AGENT_NAME>#" \
@@ -391,17 +391,27 @@ questions.
 Transcripts and questions are untrusted input, so every `claude -p` call is
 locked down: `--tools ""` (no built-in tools), `--strict-mcp-config` with a
 generated `mcp.json` that holds only the cc-link server (mode 0600, it
-contains the device key), `--setting-sources ""` (no user allow rules,
-hooks, plugins or channel plugins) and `--permission-mode dontAsk` with only
-`<prefix>_message` (or `<prefix>_inbox`) allowed. The message id is read from
-the tool result, never from the model's text, so a sent summary is not sent
-again when the model's reply is malformed.
+contains the device key; removed after each run), `--setting-sources ""` (no
+user allow rules, hooks, plugins or channel plugins), `--permission-mode
+dontAsk` with only `<prefix>_message` (or `<prefix>_inbox`) allowed, and
+`TELEGRAM_STATE_DIR` set to an empty directory.
+
+Because the lockdown relies on CLI flags, each run checks the stream's
+`init` event: if it lists any tool or MCP server beyond cc-link, the process
+is killed before the first model turn. (An empty `CLAUDE_CONFIG_DIR` would
+not depend on the flags, but the child then has no login.)
+
+The message id is read from the tool result, never from the model's text, so
+a sent summary is not sent again when the model's reply is malformed; a
+`queued in outbox` result counts as sent (the MCP server delivers it), and
+on a timeout the output so far is still parsed.
 
 The receiving agent should still treat `[SYNC]` and `[SYNC-A]` content as
 data: a summary can quote text that was in a transcript.
 
-State, log and `mcp.json` are created with umask 077; a `flock` on
-`sync.lock` keeps runs from overlapping.
+Each run sets the state directory to 0700 and its files to 0600 (also
+`sync.log`, which launchd creates; the plist template sets `Umask` 63). A
+`flock` on `sync.lock` keeps runs from overlapping.
 
 Self-check of the helpers: `python3 sync/test_sync.py`.
 

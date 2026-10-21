@@ -32,7 +32,7 @@ sync.SINCE = ''
 # idle is measured from the newest entry, not the file mtime
 assert sync.last_activity(lines) == 1767344700.0
 assert sync.last_activity(['{}']) == 0
-assert sync.last_activity([lines[0], '{"timestamp":"2026-01-03T00:00:00.1234Z"}']) == 1767261600.0  # unparsable: older entry
+assert sync.last_activity([lines[0], '{"timestamp":"not-a-date"}']) == 1767261600.0  # unparsable: older entry
 
 # extract keeps prompts and prose, drops tool calls, slash-command noise and meta entries
 text, cwd, ts = sync.extract(lines, 0)
@@ -52,8 +52,11 @@ with open(sync.LOG, 'w') as fh:
     fh.write('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\t2026-01-01\tWORK\tsent\t1\t40\n'
              'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\t2026-01-02\tWORK\tsent\t2\t90\n'
              'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\t2026-01-01\tHOME\tskipped\t-\n'
+             'cccccccc-cccc-cccc-cccc-cccccccccccc\t2026-01-01\tHOME\tskipped\t-\t70\n'
+             'dddddddd-dddd-dddd-dddd-dddddddddddd\t2026-01-01\tHOME\tsent\tqueued\t12\n'
              'not-a-session\t-\t-\tsent\t3\n')
-assert sync.covered() == {'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa': 90, 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb': 0}
+assert sync.covered() == {'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa': (90, True), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb': (0, False),
+                          'cccccccc-cccc-cccc-cccc-cccccccccccc': (70, False), 'dddddddd-dddd-dddd-dddd-dddddddddddd': (12, True)}
 
 # sent ids come from the tool result, never from the model's own text
 stream = '\n'.join([
@@ -64,7 +67,21 @@ stream = '\n'.join([
 ])
 assert sync.parse_stream(stream) == (['42'], 'Sent!')
 assert sync.parse_stream('') == ([], '')
-assert sync.has_line('x\n SKIP \n', 'SKIP') and not sync.has_line('I will not SKIP this', 'SKIP')
+queued = json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'queued in outbox (timeout), will retry.'}]}})
+assert sync.parse_stream(queued) == (['queued'], '')
+assert sync.has_line('x\n SKIP \n', 'SKIP') and sync.has_line('`SKIP`.', 'SKIP') and sync.has_line('**NOOP**', 'NOOP')
+assert not sync.has_line('I will not SKIP this', 'SKIP')
+
+# the lockdown check accepts only cc-link tools and servers
+sync.check_lockdown({'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}]})
+for bad in ({'tools': ['Bash', 'mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}]},
+            {'tools': ['mcp__cc-link__agent_message'], 'mcp_servers': [{'name': 'cc-link'}, {'name': 'other'}]},
+            {'tools': [], 'mcp_servers': [{'name': 'cc-link'}]}):
+    try:
+        sync.check_lockdown(bad)
+        raise AssertionError(bad)
+    except RuntimeError:
+        pass
 
 # folder key matches the MCP server's identity.ts (sha256 of the realpath, 8 hex chars)
 assert sync.folder_key('/') == '8a5edab2'

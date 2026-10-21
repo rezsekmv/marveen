@@ -31,7 +31,7 @@ Configuration (environment):
 The dashboard URL and device key are read from the cc-link entry in
 ~/.claude.json (user-scope registration), never from this script's env.
 """
-import fcntl, glob, hashlib, json, os, re, subprocess, sys, time, urllib.request
+import fcntl, glob, hashlib, json, os, re, subprocess, sys, threading, time, urllib.request
 from datetime import datetime
 
 HOME = os.path.expanduser('~')
@@ -47,7 +47,9 @@ CATEGORIES = [(label.strip(), os.path.realpath(os.path.expanduser(path.strip()))
 LOG = f'{SYNC}/sent.tsv'
 ANSWERED = f'{SYNC}/answered.txt'
 RUN_DIR = f'{SYNC}/run'
-MCP_CONFIG = f'{SYNC}/mcp.json'  # cc-link only, for the locked-down claude -p (holds the device key: 0600)
+MCP_CONFIG = f'{SYNC}/mcp.json'  # cc-link only, for the locked-down claude -p (holds the device key: 0600, removed after the run)
+EMPTY_DIR = f'{SYNC}/empty'  # TELEGRAM_STATE_DIR for children, so a channel plugin can never touch the real one
+TIMEOUT_SEC = 900
 MAX_CHARS = 400_000  # keep the tail of huge transcripts; chunk if summaries get too shallow
 MESSAGE_TOOL = f'mcp__cc-link__{PREFIX}_message'
 INBOX_TOOL = f'mcp__cc-link__{PREFIX}_inbox'
@@ -66,7 +68,10 @@ def category(cwd):
 
 
 def covered():
-    """session id -> transcript line count already summarized (0 for rows without a count)."""
+    """session id -> (transcript lines already handled, whether any summary was sent).
+
+    Rows without a line count give 0; a row was sent when it has a message id (or `queued`).
+    """
     out = {}
     if not os.path.exists(LOG):
         return out
@@ -75,7 +80,9 @@ def covered():
         if len(f) < 4 or not re.fullmatch(r'[0-9a-f-]{36}', f[0]):
             continue
         n = int(f[5]) if len(f) > 5 and f[5].isdigit() else 0
-        out[f[0]] = max(out.get(f[0], 0), n)
+        sent = len(f) > 4 and (f[4].isdigit() or f[4] == 'queued')
+        prev_n, prev_sent = out.get(f[0], (0, False))
+        out[f[0]] = (max(prev_n, n), prev_sent or sent)
     return out
 
 
@@ -89,7 +96,7 @@ def first_line_since(lines, day):
 
 
 def start_line(lines, done):
-    """Where the next summary of a transcript starts."""
+    """Where the next summary of a transcript starts (`done` = lines already handled)."""
     if done:
         return done
     return first_line_since(lines, SINCE) if SINCE else 0
@@ -136,9 +143,10 @@ def brief(name):
 
 def write_mcp_config():
     entry = json.load(open(f'{HOME}/.claude.json'))['mcpServers']['cc-link']
-    fd = os.open(MCP_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as fh:
+    tmp = f'{MCP_CONFIG}.{os.getpid()}'
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as fh:
         json.dump({'mcpServers': {'cc-link': entry}}, fh)
+    os.replace(tmp, MCP_CONFIG)  # a fresh 0600 file, whatever mode an older one had
 
 
 def parse_stream(out):
@@ -154,23 +162,66 @@ def parse_stream(out):
                 if isinstance(b, dict) and b.get('type') == 'tool_result':
                     c = b.get('content')
                     c = c if isinstance(c, str) else ' '.join(x.get('text', '') for x in c or [])
-                    ids += re.findall(r'^sent \(id (\d+)\)', c)
+                    ids += re.findall(r'^(?:sent|answer) \(id (\d+)\)', c)
+                    if c.startswith('queued in outbox'):  # the MCP server sends it later: as good as sent
+                        ids.append('queued')
         elif ev.get('type') == 'result':
             text = ev.get('result') or ''
     return ids, text
 
 
+def check_lockdown(ev):
+    """The init event must show only cc-link: the lockdown depends on CLI flags, so verify it on every run."""
+    tools = ev.get('tools') or []
+    servers = [m.get('name') for m in ev.get('mcp_servers') or []]
+    if not tools or any(not t.startswith('mcp__cc-link__') for t in tools) or servers != ['cc-link']:
+        raise RuntimeError(f'lockdown not in effect (tools={tools}, mcp={servers})')
+
+
 def claude(prompt, model, tool):
-    """claude -p over untrusted text: only `tool`, no built-in tools, no user settings, plugins or other MCP servers."""
-    r = subprocess.run(['claude', '-p', '--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', MCP_CONFIG,
-                        '--setting-sources', '', '--permission-mode', 'dontAsk', '--allowedTools', tool,
-                        '--output-format', 'stream-json', '--verbose'],
-                       input=prompt, capture_output=True, text=True, cwd=RUN_DIR, timeout=900)
-    return parse_stream(r.stdout)
+    """claude -p over untrusted text: only `tool`, no built-in tools, no user settings, plugins or other MCP servers.
+
+    Returns (sent ids, final text, returncode, stderr tail). Killed before the first model turn when the
+    init event shows anything beyond cc-link; on timeout the output so far is still parsed, so a send that
+    already happened is recorded.
+    """
+    p = subprocess.Popen(['claude', '-p', '--model', model, '--tools', '', '--strict-mcp-config', '--mcp-config', MCP_CONFIG,
+                          '--setting-sources', '', '--permission-mode', 'dontAsk', '--allowedTools', tool,
+                          '--output-format', 'stream-json', '--verbose'],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         cwd=RUN_DIR, env={**os.environ, 'TELEGRAM_STATE_DIR': EMPTY_DIR})
+    err = []
+    threading.Thread(target=lambda: (p.stdin.write(prompt), p.stdin.close()), daemon=True).start()
+    threading.Thread(target=lambda: err.append(p.stderr.read()), daemon=True).start()
+    timer = threading.Timer(TIMEOUT_SEC, p.kill)
+    timer.start()
+    out, checked = [], False
+    try:
+        for line in p.stdout:
+            out.append(line)
+            if not checked:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get('type') != 'system':  # fail closed: nothing may happen before the init check
+                    raise RuntimeError(f'no init event before {ev.get("type")}')
+                if ev.get('subtype') == 'init':
+                    check_lockdown(ev)
+                    checked = True
+    except RuntimeError:
+        p.kill()
+        raise
+    finally:
+        p.wait()
+        timer.cancel()
+    ids, text = parse_stream(''.join(out))
+    return ids, text, p.returncode, ''.join(err)[-300:]
 
 
 def has_line(text, word):
-    return any(line.strip() == word for line in text.splitlines())
+    """`word` alone on a line, ignoring markdown and punctuation around it."""
+    return any(re.sub(r'[^A-Za-z]', '', line) == word for line in text.splitlines())
 
 
 def server_env():
@@ -200,18 +251,19 @@ def summarize(sid, cat, cwd, date, text, partial):
     prompt = (brief('summary-brief.md') + f'\n\nHeader (first line of the message): {header}\n'
               + ('This is a CONTINUATION: only the part since the previous summary is below; summarize only that.\n' if partial else '')
               + '\n--- TRANSCRIPT START ---\n' + text + '\n--- TRANSCRIPT END ---\n')
-    ids, text = claude(prompt, MODEL, MESSAGE_TOOL)
+    ids, text, rc, err = claude(prompt, MODEL, MESSAGE_TOOL)
     if ids:  # taken from the tool result, so a sent summary is never sent again
         return 'sent', ids[0]
     if has_line(text, 'SKIP'):
         return 'skipped', '-'
-    raise RuntimeError(f'nothing sent: {text[-300:]}')
+    raise RuntimeError(f'nothing sent (rc={rc}): {text[-300:]} | stderr: {err}')
 
 
 def sync_session(f, done, now, dry):
     sid = os.path.basename(f)[:-6]
     lines = open(f, errors='replace').read().splitlines()
-    start = start_line(lines, done.get(sid))
+    handled, was_sent = done.get(sid, (0, False))
+    start = start_line(lines, handled)
     if start >= len(lines) or now - last_activity(lines) < IDLE_SEC:
         return
     text, cwd, ts = extract(lines, start)
@@ -219,7 +271,7 @@ def sync_session(f, done, now, dry):
     if dry:
         print(f'would send {sid[:8]} {cat} lines {start}-{len(lines)} chars={len(text)}')
         return
-    row = summarize(sid, cat, cwd, (ts or '')[:10], text, bool(done.get(sid))) if text.strip() else ('skipped', '-')
+    row = summarize(sid, cat, cwd, (ts or '')[:10], text, was_sent) if text.strip() else ('skipped', '-')
     with open(LOG, 'a') as fh:
         fh.write('\t'.join([sid, time.strftime('%Y-%m-%d'), cat, row[0], row[1], str(len(lines))]) + '\n')
     print(f'{time.strftime("%F %T")} {sid[:8]} {cat} {row[0]} {row[1]}')
@@ -277,13 +329,14 @@ def answer_questions(who):
         for f in files:
             text, cwd, _ = extract(open(f, errors='replace').read().splitlines(), 0)
             transcripts += f'\n--- TRANSCRIPT session:{os.path.basename(f)[:8]} ({cwd}) ---\n{text[-share:]}\n'
-        ids, text = claude(brief('answer-brief.md') + f'\n\nMessage id: {mid}\n--- MESSAGE ---\n{msg.get("text", "")}\n'
+        ids, text, rc, err = claude(brief('answer-brief.md') + f'\n\nMessage id: {mid}\n--- MESSAGE ---\n{msg.get("text", "")}\n'
                            + (transcripts or '\n(no summarized session referenced or found)\n'), MODEL, MESSAGE_TOOL)
         if not ids and not has_line(text, 'NOOP'):
-            print(f'answer {mid} failed: {text[-300:]}', file=sys.stderr)
+            print(f'answer {mid} failed (rc={rc}): {text[-300:]} | stderr: {err}', file=sys.stderr)
             continue
         with open(ANSWERED, 'a') as fh:
             fh.write(mid + '\n')
+        answered.add(mid)  # received.jsonl can hold the same message twice
         print(f'{time.strftime("%F %T")} answer to {mid}: {"sent " + ids[0] if ids else "NOOP"}')
 
 
@@ -292,8 +345,19 @@ def project_dir_name(path):
     return re.sub(r'[^A-Za-z0-9]', '-', os.path.realpath(path))
 
 
+def secure_state():
+    """0700 dirs, 0600 files, also for ones created earlier or by launchd (sync.log)."""
+    for d in (SYNC, RUN_DIR, EMPTY_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    for name in os.listdir(SYNC):
+        path = f'{SYNC}/{name}'
+        if os.path.isfile(path):
+            os.chmod(path, 0o600)
+
+
 def main(dry):
-    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    secure_state()
     if dry:
         print(f'questions go to folder:{folder_key(RUN_DIR)}')
         sync_sessions(True)
@@ -303,11 +367,14 @@ def main(dry):
         print(f'{time.strftime("%F %T")} dashboard unreachable, skipping')
         return
     write_mcp_config()
-    sync_sessions(False)
     try:
-        answer_questions(who)
-    except Exception as e:
-        print(f'answer step failed: {e}', file=sys.stderr)
+        sync_sessions(False)
+        try:
+            answer_questions(who)
+        except Exception as e:
+            print(f'answer step failed: {e}', file=sys.stderr)
+    finally:
+        os.remove(MCP_CONFIG)  # the device key does not stay on disk outside ~/.claude.json
 
 
 if __name__ == '__main__':

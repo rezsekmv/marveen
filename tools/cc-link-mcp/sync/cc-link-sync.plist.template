@@ -24,6 +24,7 @@
     <key>CC_LINK_SYNC_CATEGORIES</key><string></string>
   </dict>
   <key>WorkingDirectory</key><string>__HOME__/.cc-link/sync</string>
+  <key>Umask</key><integer>63</integer>  <!-- 077: sync.log is created by launchd -->
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>__HOME__/.cc-link/sync/sync.log</string>
