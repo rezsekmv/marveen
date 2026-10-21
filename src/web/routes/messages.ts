@@ -493,8 +493,14 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // `agent-<name>` tmux probe) says stopped forever, and the router never
     // abandons its messages. Telling the sender the row "elveszik" would be
     // false, and the suggested fix (start the agent here) is not even possible.
+    // A SYSTEM_SENDER_IDS recipient is exempt too (cc-link: a laptop's device
+    // sender id): it has no tmux session here by definition, so the probe says
+    // stopped forever, and its client claims its rows over the API (cc-link
+    // also delivers rows the router failed as abandoned). The warning and its
+    // "start it" fix were therefore always false for it (msg 736).
     if (!storedTo.includes('/')
         && sanitizeAgentIdent(storedTo) !== sanitizeAgentIdent(MAIN_AGENT_ID)
+        && !isSystemRecipient
         && !readAgentPullDelivery(sanitizeAgentIdent(storedTo))
         && !isAgentRunning(sanitizeAgentIdent(storedTo))) {
       logger.warn({ id: msg.id, to: msg.to_agent }, 'Agent message queued for a STOPPED agent -- delivered if it starts within the abandon window')
