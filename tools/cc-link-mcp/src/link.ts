@@ -40,7 +40,7 @@ import { atomicWriteJson, defaultBootMs, defaultIsAlive, ensureDir, LockBusyErro
 import { detectIdentity, type SessionIdentity } from './identity.ts'
 import { DEDUP_LOOKBACK, findDuplicateRow, Outbox, WEEK_MS, type FlushResult, type FlushSent } from './outbox.ts'
 import { findSecrets } from './secrets.ts'
-import { AskStore, BroadcastStore, SessionRegistry } from './state.ts'
+import { AskStore, BroadcastStore, isBroadcastStale, SessionRegistry, sameSession, type SessionRef } from './state.ts'
 import { REMOVED_SUFFIXES, toolNames, type ToolNames } from './tools.ts'
 
 export const MAX_TEXT = 8000
@@ -54,6 +54,13 @@ export const INBOX_LOCK_WAIT_MS = 30_000
 export const SKIPPED_MAX = 1000
 /** How long a send waits for another session's outbox flush before queueing behind it. */
 export const FLUSH_LOCK_WAIT_MS = 15_000
+/**
+ * A running session's inbox tick lists pending rows only; every this-many
+ * ticks (about 5 minutes at the default 15 s) it also scans the conversation,
+ * so a row the router abandoned while no session looked (e.g. the laptop
+ * slept) is claimed without waiting for a new session.
+ */
+export const FULL_SCAN_EVERY = 20
 
 export type NotifyFn = (content: string, meta: Record<string, string>) => Promise<void> | void
 
@@ -210,8 +217,14 @@ export class CcLink {
   private senderMismatch?: string
   private polling = false
   private inboxPolling = false
+  /** Inbox ticks so far: every FULL_SCAN_EVERY-th one also scans the conversation (router-failed rows). */
+  private inboxTicks = 0
+  /** Last inbox-poll error logged, so an outage is logged once, not every tick. */
+  private lastInboxPollError?: string
   /** Broadcast entries this session has already taken (by message id). */
   private readonly broadcastTaken = new Set<number>()
+  /** The start time this session registered with (sessions/<pid>.json); unset if registering failed. */
+  private sessionSince?: string
   private flushing?: Promise<FlushResult | undefined>
   private timers: ReturnType<typeof setInterval>[] = []
   readonly receivedLogPath: string
@@ -978,7 +991,7 @@ export class CcLink {
    * shows it itself and hands it to every OTHER session running in its folder
    * at that moment through broadcast.json.
    */
-  async claimInbox(opts: { tick?: boolean } = {}): Promise<number[]> {
+  async claimInbox(opts: { tick?: boolean; fullScan?: boolean } = {}): Promise<number[]> {
     const api = this.deps.api
     if (this.cfg.dryRun || !api) return []
     const main = await this.resolveMain()
@@ -1011,7 +1024,7 @@ export class CcLink {
           lock.touch()
           const skipped = this.readSkipped()
           const baseUrl = this.cfg.url ?? ''
-          const rows = await this.fetchInboxRows(opts.tick === true)
+          const rows = await this.fetchInboxRows(opts.tick === true && !opts.fullScan)
           const selected = selectInbox(rows, ctx).filter(r => !isSkipped(r, skipped, baseUrl))
           for (const candidate of selected) {
             try {
@@ -1061,7 +1074,7 @@ export class CcLink {
 
   /** Hand a claimed row to the other sessions running in this folder right now (none: nothing to do). */
   private async handOut(row: MessageRow): Promise<void> {
-    const others = this.deps.sessions.alive(this.deps.isAlive, this.deps.bootMs).filter(p => p !== this.deps.pid)
+    const others = this.deps.sessions.alive(this.deps.isAlive, this.deps.bootMs).filter(r => r.pid !== this.deps.pid)
     if (others.length === 0) return
     try {
       await this.deps.broadcast.add({
@@ -1087,9 +1100,14 @@ export class CcLink {
     if (this.cfg.dryRun || this.cfg.errors.length > 0) return []
     const entries = this.deps.broadcast.read()
     if (entries.length === 0) return []
-    const mine = entries.filter(e => e.recipients.includes(this.deps.pid) && !this.broadcastTaken.has(e.id))
+    const self = this.sessionRef()
+    const mine = self
+      ? entries.filter(e => e.recipients.some(r => sameSession(r, self)) && !this.broadcastTaken.has(e.id))
+      : []
+    // Claim them all BEFORE the first await: a tool call and a tick can overlap,
+    // and the second must not push the same entry again.
+    for (const e of mine) this.broadcastTaken.add(e.id)
     for (const e of mine) {
-      this.broadcastTaken.add(e.id)
       const item = this.record({
         kind: 'inbox',
         id: e.id,
@@ -1102,11 +1120,13 @@ export class CcLink {
       await this.push(displayText(item), { kind: 'inbox', msg_id: String(e.id), from: e.from })
     }
     const taken = mine.map(e => e.id)
-    // Also prune entries nobody alive still waits for (their recipients exited).
-    const stale = entries.some(e => !e.recipients.some(p => this.deps.isAlive(p)))
+    // Also prune entries no current session still waits for, or too old.
+    const isCurrent = (r: SessionRef) => this.deps.sessions.isCurrent(r, this.deps.isAlive)
+    const now = this.deps.now()
+    const stale = entries.some(e => isBroadcastStale(e, isCurrent, now))
     try {
       if (taken.length > 0 || stale) {
-        await this.deps.broadcast.done(this.deps.pid, taken, this.deps.isAlive, this.deps.now())
+        await this.deps.broadcast.done(self ?? { pid: this.deps.pid, since: '' }, taken, isCurrent, now)
       }
     } catch (err) {
       // Shown already (broadcastTaken keeps it from repeating); the cleanup is retried next time.
@@ -1115,14 +1135,22 @@ export class CcLink {
     return taken
   }
 
+  private sessionRef(): SessionRef | undefined {
+    return this.sessionSince ? { pid: this.deps.pid, since: this.sessionSince } : undefined
+  }
+
   /** Watcher tick of a running session: claim new folder-inbox rows, take the ones others claimed. */
   async pollFolderInbox(): Promise<void> {
     if (this.cfg.dryRun || !this.deps.api || this.cfg.errors.length > 0 || this.inboxPolling) return
     this.inboxPolling = true
     try {
-      await this.claimInbox({ tick: true })
+      this.inboxTicks++
+      await this.claimInbox({ tick: true, fullScan: this.inboxTicks % FULL_SCAN_EVERY === 0 })
+      this.lastInboxPollError = undefined
     } catch (err) {
-      this.deps.log(`inbox poll: ${errMsg(err)}`)
+      const msg = errMsg(err)
+      if (msg !== this.lastInboxPollError) this.deps.log(`inbox poll: ${msg}`)
+      this.lastInboxPollError = msg
     } finally {
       this.inboxPolling = false
     }
@@ -1132,7 +1160,9 @@ export class CcLink {
   /** Count this session as running in its folder (the claimer hands messages to it). */
   private registerSession(): void {
     try {
-      this.deps.sessions.register(this.deps.pid, this.nowIso())
+      const since = this.nowIso()
+      this.deps.sessions.register(this.deps.pid, since)
+      this.sessionSince = since
     } catch (err) {
       this.deps.log(`could not register the session in its folder: ${errMsg(err)}`)
     }

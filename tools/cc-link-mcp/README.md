@@ -182,7 +182,9 @@ dashboard's 120 character cut so `folder:<folder-key>` always survives.
    "unaddressed" (peek only).
 4. **Claiming** happens at session start (pending rows plus the newest 200
    conversation rows, waiting up to 30 s for the lock) and on every watcher
-   tick of a running session (pending rows only; a busy lock skips the round).
+   tick of a running session (pending rows only, plus the conversation scan
+   every 20th tick, about 5 minutes, so a row the router abandoned while no
+   session looked is still claimed; a busy lock skips the round).
    It runs under one machine-wide lock (`<state-dir>/inbox.lock`), so a
    message is claimed exactly once even when sessions in several folders look
    at the same moment: the first session to see it closes it on the dashboard
@@ -190,10 +192,13 @@ dashboard's 120 character cut so `folder:<folder-key>` always survives.
    first, and hands it to the other sessions running in its folder at that
    moment through `<state-dir>/folders/<folder-key>/broadcast.json`. They take
    it on their next tick or tool call (local file, no network) and drop
-   themselves from its recipients; an entry is removed once no live recipient
-   is left (or after 7 days). Running sessions are registered in
-   `<state-dir>/folders/<folder-key>/sessions/<pid>.json` (removed on a clean
-   exit; a dead pid or a file from before the last boot does not count). If
+   themselves from its recipients; an entry is removed once no current
+   recipient is left, or after 7 days. Running sessions are registered in
+   `<state-dir>/folders/<folder-key>/sessions/<pid>.json` with their start
+   time (removed on a clean exit; a dead pid or a file from before the last
+   boot does not count). A recipient is the pid AND that start time, so a pid
+   reused after an unclean exit is a different session and gets nothing meant
+   for the old one. If
    closing fails, the message is left for a later look. A message that
    addresses several folders is claimed once, by the first folder that sees
    it.

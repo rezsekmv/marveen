@@ -8,8 +8,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireLock } from '../src/fsutil.ts'
-import { SessionRegistry } from '../src/state.ts'
-import { addr, fakeIdentity, framed, makeHarness, makeLink, type Harness } from './helpers.ts'
+import { BROADCAST_MAX_AGE_MS, SessionRegistry } from '../src/state.ts'
+import { FULL_SCAN_EVERY } from '../src/link.ts'
+import { addr, fakeIdentity, framed, makeHarness, makeLink, ROUTER_ABANDON_REASON, type Harness } from './helpers.ts'
 
 describe('folder messages to running sessions', () => {
   let h: Harness
@@ -32,7 +33,7 @@ describe('folder messages to running sessions', () => {
     expect(h.dash.puts().filter(p => p.path === `/api/messages/${m.id}`).length).toBe(1)
     expect(h.dash.rows.get(m.id)!.status).toBe('done')
     expect(a.notified).toEqual([{ content: framed('to the folder'), meta: { kind: 'inbox', msg_id: String(m.id), from: 'main-agent' } }])
-    expect(a.link.deps.broadcast.read().map(e => [e.id, e.recipients])).toEqual([[m.id, [9002]]])
+    expect(a.link.deps.broadcast.read().map(e => [e.id, e.recipients.map(r => r.pid)])).toEqual([[m.id, [9002]]])
 
     await b.link.pollFolderInbox()
     expect(b.notified).toEqual(a.notified)
@@ -96,7 +97,7 @@ describe('folder messages to running sessions', () => {
     h.alive.delete(9052)
     h.dash.addInbox({ content: 'x', origin_note: addr(a.link.deps.identity.folderKey) })
     await a.link.pollFolderInbox()
-    expect(a.link.deps.broadcast.read()[0]!.recipients).toEqual([9053])
+    expect(a.link.deps.broadcast.read()[0]!.recipients.map(r => r.pid)).toEqual([9053])
 
     h.alive.delete(9053) // crashed before its tick
     await a.link.receiveBroadcasts()
@@ -135,8 +136,71 @@ describe('folder messages to running sessions', () => {
     reg.register(2, '2026-10-21T07:00:00Z') // before the boot: pid reused
     reg.register(3, '2026-10-21T09:00:00Z') // dead
     writeFileSync(join(reg.dir, 'junk.json'), '{}')
-    expect(reg.alive(p => p !== 3, boot)).toEqual([1])
+    expect(reg.alive(p => p !== 3, boot)).toEqual([{ pid: 1, since: '2026-10-21T09:00:00Z' }])
     expect(existsSync(join(reg.dir, '2.json'))).toBe(false)
     expect(existsSync(join(reg.dir, '3.json'))).toBe(false)
+  })
+
+  // Q review of #2, medium 1.
+  test('a tool call and a tick that overlap push a handed-out entry once', async () => {
+    const a = await running(9081)
+    const b = await running(9082)
+    h.dash.addInbox({ content: 'once', origin_note: addr(a.link.deps.identity.folderKey) })
+    await a.link.pollFolderInbox()
+    await Promise.all([b.link.receiveBroadcasts(), b.link.receiveBroadcasts(), b.link.callTool('agent_inbox')])
+    expect(b.notified.map(n => n.content)).toEqual([framed('once')])
+    expect(b.link.received.length).toBe(1)
+  })
+
+  // Q review of #2, medium 2.
+  test('same-boot pid reuse after an unclean exit: the new session gets nothing old, the entry is pruned', async () => {
+    const a = await running(9091)
+    await running(9092)
+    h.dash.addInbox({ content: 'for the old 9092', origin_note: addr(a.link.deps.identity.folderKey) })
+    await a.link.pollFolderInbox()
+    expect(a.link.deps.broadcast.read().length).toBe(1)
+
+    // 9092 crashed (never unregistered) and the pid came back as a NEW session.
+    h.clock.t += 60_000
+    const reused = makeLink(h, { pid: 9092, identity: a.link.deps.identity })
+    await reused.link.startup()
+    await reused.link.pollFolderInbox()
+    expect(reused.notified).toEqual([])
+    expect(reused.link.deps.broadcast.read()).toEqual([])
+  })
+
+  test('an entry older than BROADCAST_MAX_AGE_MS is pruned even while its recipient is alive', async () => {
+    const a = await running(9101)
+    const b = await running(9102)
+    h.dash.addInbox({ content: 'old', origin_note: addr(a.link.deps.identity.folderKey) })
+    await a.link.pollFolderInbox()
+    h.clock.t += BROADCAST_MAX_AGE_MS + 1000
+    await a.link.receiveBroadcasts()
+    expect(a.link.deps.broadcast.read()).toEqual([])
+    await b.link.receiveBroadcasts()
+    expect(b.notified).toEqual([])
+  })
+
+  test('every FULL_SCAN_EVERY-th tick also claims a row the router abandoned while nobody looked', async () => {
+    const a = await running(9111)
+    const m = h.dash.addInbox({
+      content: 'abandoned overnight',
+      origin_note: addr(a.link.deps.identity.folderKey),
+      status: 'failed',
+      result: ROUTER_ABANDON_REASON,
+      failed_by: 'router',
+    })
+    for (let i = 1; i < FULL_SCAN_EVERY; i++) await a.link.pollFolderInbox()
+    expect(a.notified).toEqual([])
+    await a.link.pollFolderInbox()
+    expect(a.notified.map(n => n.content)).toEqual([framed('abandoned overnight')])
+    expect(h.dash.rows.get(m.id)!.status).toBe('done')
+  })
+
+  test('an outage is logged once, not on every tick', async () => {
+    const a = await running(9121)
+    h.dash.override = () => 'network'
+    for (let i = 0; i < 5; i++) await a.link.pollFolderInbox()
+    expect(a.logs.filter(l => l.startsWith('inbox poll')).length).toBe(1)
   })
 })

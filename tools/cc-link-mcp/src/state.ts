@@ -115,25 +115,53 @@ export class SessionRegistry {
     }
   }
 
-  /** Pids of the live sessions in this folder. */
-  alive(isAlive: (pid: number) => boolean, bootMs?: number): number[] {
+  /**
+   * Is `ref` still the session that registered under its pid? A pid that died
+   * uncleanly and was reused in the same boot is caught here: the new session
+   * re-registered with another start time (or nobody did), so the old ref
+   * does not match.
+   */
+  isCurrent(ref: SessionRef, isAlive: (pid: number) => boolean): boolean {
+    if (!isAlive(ref.pid)) return false
+    const rec = readJsonFile<{ startedAt?: unknown }>(this.path(ref.pid), {})
+    return rec.startedAt === ref.since
+  }
+
+  /** The live sessions in this folder (pid + start time), by pid. */
+  alive(isAlive: (pid: number) => boolean, bootMs?: number): SessionRef[] {
     let names: string[]
     try {
       names = readdirSync(this.dir).filter(n => /^\d+\.json$/.test(n))
     } catch {
       return []
     }
-    const out: number[] = []
+    const out: SessionRef[] = []
     for (const n of names) {
       const pid = Number(n.slice(0, -5))
       const rec = readJsonFile<{ startedAt?: unknown }>(join(this.dir, n), {})
-      const since = typeof rec.startedAt === 'string' ? Date.parse(rec.startedAt) : NaN
+      const startedAt = typeof rec.startedAt === 'string' ? rec.startedAt : undefined
+      const since = startedAt ? Date.parse(startedAt) : NaN
       const beforeBoot = bootMs !== undefined && Number.isFinite(since) && since < bootMs
-      if (!beforeBoot && isAlive(pid)) out.push(pid)
+      if (startedAt && !beforeBoot && isAlive(pid)) out.push({ pid, since: startedAt })
       else this.unregister(pid)
     }
-    return out.sort((a, b) => a - b)
+    return out.sort((a, b) => a.pid - b.pid)
   }
+}
+
+/** One running session: its pid plus the start time it registered with (pids get reused). */
+export interface SessionRef {
+  pid: number
+  /** ISO start time, as written to sessions/<pid>.json. */
+  since: string
+}
+
+export function sameSession(a: SessionRef, b: SessionRef): boolean {
+  return a.pid === b.pid && a.since === b.since
+}
+
+function isSessionRef(x: unknown): x is SessionRef {
+  return !!x && typeof x === 'object' && typeof (x as SessionRef).pid === 'number' && typeof (x as SessionRef).since === 'string'
 }
 
 /** A folder-inbox message one session claimed, waiting to be shown to the other sessions running at claim time. */
@@ -143,8 +171,8 @@ export interface BroadcastEntry {
   content: string
   /** ISO time of the claim. */
   claimedAt: string
-  /** Pids that still have to receive it. */
-  recipients: number[]
+  /** Sessions that still have to receive it. */
+  recipients: SessionRef[]
 }
 
 function isBroadcastEntry(x: unknown): x is BroadcastEntry {
@@ -155,7 +183,8 @@ function isBroadcastEntry(x: unknown): x is BroadcastEntry {
     typeof r.from === 'string' &&
     typeof r.content === 'string' &&
     typeof r.claimedAt === 'string' &&
-    Array.isArray(r.recipients)
+    Array.isArray(r.recipients) &&
+    r.recipients.every(isSessionRef)
   )
 }
 
@@ -203,19 +232,28 @@ export class BroadcastStore {
   }
 
   /**
-   * `pid` has received `ids`: drop it from their recipients. Entries nobody
-   * alive still waits for, or older than BROADCAST_MAX_AGE_MS, are pruned.
+   * `self` has received `ids`: drop it from their recipients. Entries no
+   * current session still waits for, or older than BROADCAST_MAX_AGE_MS
+   * (also when the claim time is unreadable), are pruned.
    */
-  done(pid: number, ids: readonly number[], isAlive: (pid: number) => boolean, nowMs: number): Promise<BroadcastEntry[]> {
+  done(
+    self: SessionRef,
+    ids: readonly number[],
+    isCurrent: (ref: SessionRef) => boolean,
+    nowMs: number,
+  ): Promise<BroadcastEntry[]> {
     const got = new Set(ids)
     return this.update(es =>
       es
-        .map(e => (got.has(e.id) ? { ...e, recipients: e.recipients.filter(p => p !== pid) } : e))
-        .filter(e => {
-          const t = Date.parse(e.claimedAt)
-          const fresh = !Number.isFinite(t) || nowMs - t <= BROADCAST_MAX_AGE_MS
-          return fresh && e.recipients.some(p => isAlive(p))
-        }),
+        .map(e => (got.has(e.id) ? { ...e, recipients: e.recipients.filter(r => !sameSession(r, self)) } : e))
+        .filter(e => !isBroadcastStale(e, isCurrent, nowMs)),
     )
   }
+}
+
+/** Nobody current still waits for it, or it is too old (an unreadable claim time counts as too old). */
+export function isBroadcastStale(e: BroadcastEntry, isCurrent: (ref: SessionRef) => boolean, nowMs: number): boolean {
+  const t = Date.parse(e.claimedAt)
+  if (!Number.isFinite(t) || nowMs - t > BROADCAST_MAX_AGE_MS) return true
+  return !e.recipients.some(isCurrent)
 }
