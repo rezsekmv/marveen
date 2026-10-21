@@ -1,10 +1,13 @@
 /**
- * Per-folder persistent state: `<stateDir>/folders/<folderKey>/asks.json`,
- * guarded by `<stateDir>/folders/<folderKey>/lock`. Every mutation is
- * read-modify-write under the lock with an atomic rename.
+ * Per-folder persistent state under `<stateDir>/folders/<folderKey>/`:
+ * asks.json (sent messages being watched), broadcast.json (claimed inbox
+ * messages for the other running sessions) and sessions/ (who is running),
+ * guarded by `<folderDir>/lock`. Every mutation is read-modify-write under the
+ * lock with an atomic rename.
  */
+import { readdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { atomicWriteJson, readJsonFile, withLock, type LockOptions } from './fsutil.ts'
+import { atomicWriteJson, ensureDir, readJsonFile, withLock, type LockOptions } from './fsutil.ts'
 import { adoptOrphans, type AskRecord } from './delivery.ts'
 
 export function folderDir(stateDir: string, folderKey: string): string {
@@ -80,4 +83,177 @@ export class AskStore {
     })
     return adopted
   }
+}
+
+/**
+ * Running sessions of one folder: `<folderDir>/sessions/<pid>.json`. A
+ * session registers at startup and unregisters at shutdown; a file whose pid
+ * is dead, or that was written before the last boot (pid reuse), does not
+ * count and is pruned when seen.
+ */
+export class SessionRegistry {
+  readonly dir: string
+
+  constructor(stateDir: string, folderKey: string) {
+    this.dir = join(folderDir(stateDir, folderKey), 'sessions')
+  }
+
+  private path(pid: number): string {
+    return join(this.dir, `${pid}.json`)
+  }
+
+  register(pid: number, startedAt: string): void {
+    ensureDir(this.dir)
+    atomicWriteJson(this.path(pid), { pid, startedAt })
+  }
+
+  unregister(pid: number): void {
+    try {
+      unlinkSync(this.path(pid))
+    } catch {
+      // already gone
+    }
+  }
+
+  /**
+   * Is `ref` still the session that registered under its pid? A pid that died
+   * uncleanly and was reused in the same boot is caught here: the new session
+   * re-registered with another start time (or nobody did), so the old ref
+   * does not match.
+   */
+  isCurrent(ref: SessionRef, isAlive: (pid: number) => boolean): boolean {
+    if (!isAlive(ref.pid)) return false
+    const rec = readJsonFile<{ startedAt?: unknown }>(this.path(ref.pid), {})
+    return rec.startedAt === ref.since
+  }
+
+  /** The live sessions in this folder (pid + start time), by pid. */
+  alive(isAlive: (pid: number) => boolean, bootMs?: number): SessionRef[] {
+    let names: string[]
+    try {
+      names = readdirSync(this.dir).filter(n => /^\d+\.json$/.test(n))
+    } catch {
+      return []
+    }
+    const out: SessionRef[] = []
+    for (const n of names) {
+      const pid = Number(n.slice(0, -5))
+      const rec = readJsonFile<{ startedAt?: unknown }>(join(this.dir, n), {})
+      const startedAt = typeof rec.startedAt === 'string' ? rec.startedAt : undefined
+      const since = startedAt ? Date.parse(startedAt) : NaN
+      const beforeBoot = bootMs !== undefined && Number.isFinite(since) && since < bootMs
+      if (startedAt && !beforeBoot && isAlive(pid)) out.push({ pid, since: startedAt })
+      else this.unregister(pid)
+    }
+    return out.sort((a, b) => a.pid - b.pid)
+  }
+}
+
+/** One running session: its pid plus the start time it registered with (pids get reused). */
+export interface SessionRef {
+  pid: number
+  /** ISO start time, as written to sessions/<pid>.json. */
+  since: string
+}
+
+export function sameSession(a: SessionRef, b: SessionRef): boolean {
+  return a.pid === b.pid && a.since === b.since
+}
+
+function isSessionRef(x: unknown): x is SessionRef {
+  return !!x && typeof x === 'object' && typeof (x as SessionRef).pid === 'number' && typeof (x as SessionRef).since === 'string'
+}
+
+/** A folder-inbox message one session claimed, waiting to be shown to the other sessions running at claim time. */
+export interface BroadcastEntry {
+  id: number
+  from: string
+  content: string
+  /** ISO time of the claim. */
+  claimedAt: string
+  /** Sessions that still have to receive it. */
+  recipients: SessionRef[]
+}
+
+function isBroadcastEntry(x: unknown): x is BroadcastEntry {
+  if (!x || typeof x !== 'object') return false
+  const r = x as Record<string, unknown>
+  return (
+    typeof r.id === 'number' &&
+    typeof r.from === 'string' &&
+    typeof r.content === 'string' &&
+    typeof r.claimedAt === 'string' &&
+    Array.isArray(r.recipients) &&
+    r.recipients.every(isSessionRef)
+  )
+}
+
+/** Entries older than this are dropped even if a recipient never took them. */
+export const BROADCAST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+/**
+ * `<folderDir>/broadcast.json`: claimed messages for the OTHER running
+ * sessions of the folder. Guarded by the folder lock (the same file as
+ * asks.json's), written atomically.
+ */
+export class BroadcastStore {
+  readonly path: string
+  readonly lockPath: string
+
+  constructor(
+    stateDir: string,
+    folderKey: string,
+    private readonly lockOpts: LockOptions = {},
+  ) {
+    const dir = folderDir(stateDir, folderKey)
+    this.path = join(dir, 'broadcast.json')
+    this.lockPath = join(dir, 'lock')
+  }
+
+  read(): BroadcastEntry[] {
+    const raw = readJsonFile<unknown>(this.path, [])
+    return Array.isArray(raw) ? raw.filter(isBroadcastEntry) : []
+  }
+
+  private update(mutate: (entries: BroadcastEntry[]) => BroadcastEntry[]): Promise<BroadcastEntry[]> {
+    return withLock(
+      this.lockPath,
+      () => {
+        const next = mutate(this.read())
+        atomicWriteJson(this.path, next)
+        return next
+      },
+      this.lockOpts,
+    )
+  }
+
+  add(entry: BroadcastEntry): Promise<BroadcastEntry[]> {
+    return this.update(es => [...es.filter(e => e.id !== entry.id), entry])
+  }
+
+  /**
+   * `self` has received `ids`: drop it from their recipients. Entries no
+   * current session still waits for, or older than BROADCAST_MAX_AGE_MS
+   * (also when the claim time is unreadable), are pruned.
+   */
+  done(
+    self: SessionRef,
+    ids: readonly number[],
+    isCurrent: (ref: SessionRef) => boolean,
+    nowMs: number,
+  ): Promise<BroadcastEntry[]> {
+    const got = new Set(ids)
+    return this.update(es =>
+      es
+        .map(e => (got.has(e.id) ? { ...e, recipients: e.recipients.filter(r => !sameSession(r, self)) } : e))
+        .filter(e => !isBroadcastStale(e, isCurrent, nowMs)),
+    )
+  }
+}
+
+/** Nobody current still waits for it, or it is too old (an unreadable claim time counts as too old). */
+export function isBroadcastStale(e: BroadcastEntry, isCurrent: (ref: SessionRef) => boolean, nowMs: number): boolean {
+  const t = Date.parse(e.claimedAt)
+  if (!Number.isFinite(t) || nowMs - t > BROADCAST_MAX_AGE_MS) return true
+  return !e.recipients.some(isCurrent)
 }

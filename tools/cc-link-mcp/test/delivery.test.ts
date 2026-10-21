@@ -201,7 +201,7 @@ describe('rule 2: orphan asks are adopted by a NEW session only', () => {
   })
 })
 
-describe('rule 3: folder inbox is claimed only at startup', () => {
+describe('rule 3: folder inbox is claimed at startup and by running sessions', () => {
   let h: Harness
   beforeEach(() => (h = makeHarness()))
   afterEach(() => h.cleanup())
@@ -243,21 +243,23 @@ describe('rule 3: folder inbox is claimed only at startup', () => {
     )
   })
 
-  test('a running session does not claim through tool calls or the watcher; agent_inbox only peeks', async () => {
+  test('a running session claims on its inbox tick, not through tool calls or the answer watcher', async () => {
     const id = fakeIdentity()
     h.alive.add(500)
     const s = makeLink(h, { pid: 500, identity: id })
     await s.link.startup()
-    h.dash.addInbox({ content: 'arrived later', origin_note: addr(id.folderKey) })
+    const later = h.dash.addInbox({ content: 'arrived later', origin_note: addr(id.folderKey) })
 
     const inbox = await s.link.callTool('agent_inbox')
     await s.link.callTool('agent_message', { text: 'note' })
     await s.link.pollOwnAsks()
-    await s.link.callTool('agent_inbox')
-
-    expect(inbox.text).toContain('folder inbox: 1 message(s) waiting')
+    expect(inbox.text).toContain('folder inbox: 1 message(s) addressed to this folder, not claimed yet')
     expect(s.notified).toEqual([])
     expect(h.dash.puts()).toEqual([])
+
+    await s.link.pollFolderInbox()
+    expect(s.notified.map(n => n.content)).toEqual([framed('arrived later')])
+    expect(h.dash.rows.get(later.id)!.status).toBe('done')
   })
 })
 
@@ -295,11 +297,19 @@ describe('rule 4: claiming', () => {
     const a = makeLink(h, { pid: 701, identity: id })
     const b = makeLink(h, { pid: 702, identity: id })
     await Promise.all([a.link.startup(), b.link.startup()])
+    // Whoever lost a race for a row gets it handed out on its next look.
+    await a.link.receiveBroadcasts()
+    await b.link.receiveBroadcasts()
 
     for (const m of msgs) {
       expect(h.dash.puts().filter(p => p.path === `/api/messages/${m.id}`).length).toBe(1)
     }
-    const all = [...a.notified, ...b.notified].map(n => n.content).sort()
+    // Claimed once on the dashboard; each message shown once per session that saw it.
+    for (const s of [a, b]) {
+      const got = s.notified.map(n => n.content)
+      expect(new Set(got).size).toBe(got.length)
+    }
+    const all = [...new Set([...a.notified, ...b.notified].map(n => n.content))].sort()
     expect(all).toEqual(['m1', 'm2', 'm3'].map(framed))
   })
 
