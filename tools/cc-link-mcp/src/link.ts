@@ -36,11 +36,11 @@ import {
   statusLine,
   stripHeader,
 } from './format.ts'
-import { atomicWriteJson, defaultBootMs, defaultIsAlive, ensureDir, readJsonFile, withLock, type IsAlive, type LockOptions, type Now } from './fsutil.ts'
+import { atomicWriteJson, defaultBootMs, defaultIsAlive, ensureDir, LockBusyError, readJsonFile, withLock, type IsAlive, type LockOptions, type Now } from './fsutil.ts'
 import { detectIdentity, type SessionIdentity } from './identity.ts'
 import { DEDUP_LOOKBACK, findDuplicateRow, Outbox, WEEK_MS, type FlushResult, type FlushSent } from './outbox.ts'
 import { findSecrets } from './secrets.ts'
-import { AskStore } from './state.ts'
+import { AskStore, BroadcastStore, SessionRegistry } from './state.ts'
 import { REMOVED_SUFFIXES, toolNames, type ToolNames } from './tools.ts'
 
 export const MAX_TEXT = 8000
@@ -78,6 +78,10 @@ export interface LinkDeps {
   askPollMs?: number
   /** Options for the machine-wide inbox lock (defaults: pid/isAlive/now above, wait INBOX_LOCK_WAIT_MS). */
   inboxLock?: LockOptions
+  /** Running sessions of THIS session's folder. */
+  sessions: SessionRegistry
+  /** Claimed inbox messages for the other running sessions of THIS folder. */
+  broadcast: BroadcastStore
 }
 
 export interface ToolResult {
@@ -205,6 +209,9 @@ export class CcLink {
   /** Set when whoami reports a different sender id than MARVEEN_SENDER_ID. */
   private senderMismatch?: string
   private polling = false
+  private inboxPolling = false
+  /** Broadcast entries this session has already taken (by message id). */
+  private readonly broadcastTaken = new Set<number>()
   private flushing?: Promise<FlushResult | undefined>
   private timers: ReturnType<typeof setInterval>[] = []
   readonly receivedLogPath: string
@@ -522,6 +529,7 @@ export class CcLink {
       }
       const t = this.tools
       if (name !== t.message && name !== t.reply && name !== t.inbox) throw this.unknownTool(name)
+      await this.receiveBroadcasts()
       const preFlush = await this.flushOutbox()
       if (name === t.message) text = await this.toolMessage(args.text, args.wait, preFlush)
       else if (name === t.reply) text = await this.toolReply(args.id)
@@ -806,8 +814,9 @@ export class CcLink {
         const ctx = { senderId: this.cfg.senderId!, mainAgentId: main.id, folderKey: this.deps.identity.folderKey }
         const waiting = selectInbox(rows, ctx)
         lines.push(
-          `folder inbox: ${waiting.length} message(s) waiting for the NEXT new session in this folder ` +
-            '(running sessions never claim them; start a new session here to receive them)',
+          `folder inbox: ${waiting.length} message(s) addressed to this folder, not claimed yet ` +
+            `(running sessions here receive them within about ${this.cfg.pollSec} s; ` +
+            'with none running, the next new session in this folder claims them)',
         )
         const unaddressed = selectUnaddressed(rows, ctx)
         if (unaddressed.length > 0) {
@@ -831,10 +840,16 @@ export class CcLink {
 
   // ---------------------------------------------------------------- startup / background
 
-  private async fetchInboxRows(): Promise<MessageRow[]> {
+  /**
+   * Pending rows to this sender, plus (unless `pendingOnly`) its newest 200
+   * conversation rows, where router-failed rows still deliverable are found.
+   */
+  private async fetchInboxRows(pendingOnly = false): Promise<MessageRow[]> {
     const api = this.deps.api!
     const sender = this.cfg.senderId!
-    const results = await Promise.allSettled([api.listPending(sender), api.listConversation(sender, 200)])
+    const results = await Promise.allSettled(
+      pendingOnly ? [api.listPending(sender)] : [api.listPending(sender), api.listConversation(sender, 200)],
+    )
     const rows: MessageRow[] = []
     const errors: string[] = []
     for (const r of results) {
@@ -858,11 +873,13 @@ export class CcLink {
       this.deps.log(`dry run: no network; folder key ${this.deps.identity.folderKey}`)
       return
     }
+    this.registerSession()
     const steps: Array<[string, () => Promise<unknown>]> = [
       ['resolve main agent', () => this.resolveMain(true)],
       ['flush outbox', () => this.flushOutbox()],
       ['adopt orphan asks', () => this.adoptOrphanAsks()],
       ['claim folder inbox', () => this.claimInbox()],
+      ['take messages handed out by other sessions', () => this.receiveBroadcasts()],
     ]
     for (const [label, step] of steps) {
       try {
@@ -952,21 +969,25 @@ export class CcLink {
 
   /**
    * Rules 3-4: claim the inbox messages addressed to this folder
-   * (`folder:<key>` in origin_note). Only called at startup. Unaddressed
+   * (`folder:<key>` in origin_note). Called at startup (full scan, waits for
+   * the lock) and on every watcher tick of a running session (pending rows
+   * only, skips the round if another session holds the lock). Unaddressed
    * messages are never claimed. The claim runs under ONE machine-wide lock
-   * (`<stateDir>/inbox.lock`), so concurrent startups never claim a row twice
-   * even if a note addresses several folders.
+   * (`<stateDir>/inbox.lock`), so a row is claimed (closed on the dashboard)
+   * exactly once even if a message addresses several folders. The claimer
+   * shows it itself and hands it to every OTHER session running in its folder
+   * at that moment through broadcast.json.
    */
-  async claimInbox(): Promise<number[]> {
+  async claimInbox(opts: { tick?: boolean } = {}): Promise<number[]> {
     const api = this.deps.api
     if (this.cfg.dryRun || !api) return []
     const main = await this.resolveMain()
     if (this.senderMismatch) {
-      this.deps.log('inbox claim skipped: sender id mismatch (see config error)')
+      if (!opts.tick) this.deps.log('inbox claim skipped: sender id mismatch (see config error)')
       return []
     }
     if (!main) {
-      this.deps.log('inbox claim skipped: main agent id unknown')
+      if (!opts.tick) this.deps.log('inbox claim skipped: main agent id unknown')
       return []
     }
     const ctx = { senderId: this.cfg.senderId!, mainAgentId: main.id, folderKey: this.deps.identity.folderKey }
@@ -977,56 +998,144 @@ export class CcLink {
       bootMs: this.deps.bootMs,
       waitMs: INBOX_LOCK_WAIT_MS,
       ...this.deps.inboxLock,
+      // A tick never waits: another session is claiming, the next tick sees its result.
+      ...(opts.tick ? { waitMs: 0 } : {}),
     }
     const claimed: number[] = []
     let skippedClosed = 0
-    await withLock(
-      this.inboxLockPath,
-      async lock => {
-        // Select under the lock, so a session that waited sees the previous claimer's result.
-        lock.touch()
-        const skipped = this.readSkipped()
-        const baseUrl = this.cfg.url ?? ''
-        const selected = selectInbox(await this.fetchInboxRows(), ctx).filter(r => !isSkipped(r, skipped, baseUrl))
-        for (const candidate of selected) {
-          try {
-            // Re-read: the row may have changed since the listing (e.g. the router failed it).
-            lock.touch()
-            const fresh = await api.getMessage(candidate.id)
-            if (!isInboxCandidate(fresh, ctx)) continue
-            lock.touch()
-            await api.markDone(candidate.id, `picked up by cc-link ${ctx.folderKey}`)
-            claimed.push(candidate.id)
-            const item = this.record({
-              kind: 'inbox',
-              id: fresh.id,
-              from: fresh.from_agent,
-              content: fresh.content,
-              status: 'done',
-              shown: false,
-              frame: DATA_FRAME,
-            })
-            await this.push(displayText(item), { kind: 'inbox', msg_id: String(fresh.id), from: fresh.from_agent })
-          } catch (err) {
-            // 409: the dashboard's status guard refused the close because someone
-            // else (another session, the router, the main agent) already closed
-            // the row. Not ours to deliver, and not an error worth logging.
-            if (err instanceof ApiError && err.status === 409) {
-              skippedClosed++
-              // Remember it: an older dashboard (no failed_by) would otherwise be
-              // asked again on every startup and answer 409 again.
-              this.rememberSkipped(candidate)
-              continue
+    try {
+      await withLock(
+        this.inboxLockPath,
+        async lock => {
+          // Select under the lock, so a session that waited sees the previous claimer's result.
+          lock.touch()
+          const skipped = this.readSkipped()
+          const baseUrl = this.cfg.url ?? ''
+          const rows = await this.fetchInboxRows(opts.tick === true)
+          const selected = selectInbox(rows, ctx).filter(r => !isSkipped(r, skipped, baseUrl))
+          for (const candidate of selected) {
+            try {
+              // Re-read: the row may have changed since the listing (e.g. the router failed it).
+              lock.touch()
+              const fresh = await api.getMessage(candidate.id)
+              if (!isInboxCandidate(fresh, ctx)) continue
+              lock.touch()
+              await api.markDone(candidate.id, `picked up by cc-link ${ctx.folderKey}`)
+              claimed.push(candidate.id)
+              await this.handOut(fresh)
+              const item = this.record({
+                kind: 'inbox',
+                id: fresh.id,
+                from: fresh.from_agent,
+                content: fresh.content,
+                status: 'done',
+                shown: false,
+                frame: DATA_FRAME,
+              })
+              await this.push(displayText(item), { kind: 'inbox', msg_id: String(fresh.id), from: fresh.from_agent })
+            } catch (err) {
+              // 409: the dashboard's status guard refused the close because someone
+              // else (another session, the router, the main agent) already closed
+              // the row. Not ours to deliver, and not an error worth logging.
+              if (err instanceof ApiError && err.status === 409) {
+                skippedClosed++
+                // Remember it: an older dashboard (no failed_by) would otherwise be
+                // asked again on every startup and answer 409 again.
+                this.rememberSkipped(candidate)
+                continue
+              }
+              this.deps.log(`inbox message ${candidate.id} not claimed: ${errMsg(err)}`)
             }
-            this.deps.log(`inbox message ${candidate.id} not claimed: ${errMsg(err)}`)
           }
-        }
-      },
-      lockOpts,
-    )
+        },
+        lockOpts,
+      )
+    } catch (err) {
+      if (opts.tick && err instanceof LockBusyError) return []
+      throw err
+    }
     if (claimed.length > 0) this.deps.log(`claimed ${claimed.length} inbox message(s): ${claimed.join(', ')}`)
     if (skippedClosed > 0) this.deps.log(`skipped ${skippedClosed} inbox message(s) already closed elsewhere (HTTP 409)`)
     return claimed
+  }
+
+  /** Hand a claimed row to the other sessions running in this folder right now (none: nothing to do). */
+  private async handOut(row: MessageRow): Promise<void> {
+    const others = this.deps.sessions.alive(this.deps.isAlive, this.deps.bootMs).filter(p => p !== this.deps.pid)
+    if (others.length === 0) return
+    try {
+      await this.deps.broadcast.add({
+        id: row.id,
+        from: row.from_agent,
+        content: row.content,
+        claimedAt: this.nowIso(),
+        recipients: others,
+      })
+    } catch (err) {
+      // The row is closed already; the claimer still shows it, the others miss it.
+      this.deps.log(`could not hand inbox message ${row.id} to the other running sessions: ${errMsg(err)}`)
+    }
+  }
+
+  /**
+   * Take the inbox messages another session of this folder claimed while this
+   * one was running (broadcast.json): record, push, then drop this pid from
+   * their recipients. Local files only, so it is cheap enough for every tool
+   * call. Returns the ids taken.
+   */
+  async receiveBroadcasts(): Promise<number[]> {
+    if (this.cfg.dryRun || this.cfg.errors.length > 0) return []
+    const entries = this.deps.broadcast.read()
+    if (entries.length === 0) return []
+    const mine = entries.filter(e => e.recipients.includes(this.deps.pid) && !this.broadcastTaken.has(e.id))
+    for (const e of mine) {
+      this.broadcastTaken.add(e.id)
+      const item = this.record({
+        kind: 'inbox',
+        id: e.id,
+        from: e.from,
+        content: e.content,
+        status: 'done',
+        shown: false,
+        frame: DATA_FRAME,
+      })
+      await this.push(displayText(item), { kind: 'inbox', msg_id: String(e.id), from: e.from })
+    }
+    const taken = mine.map(e => e.id)
+    // Also prune entries nobody alive still waits for (their recipients exited).
+    const stale = entries.some(e => !e.recipients.some(p => this.deps.isAlive(p)))
+    try {
+      if (taken.length > 0 || stale) {
+        await this.deps.broadcast.done(this.deps.pid, taken, this.deps.isAlive, this.deps.now())
+      }
+    } catch (err) {
+      // Shown already (broadcastTaken keeps it from repeating); the cleanup is retried next time.
+      this.deps.log(`could not update broadcast.json: ${errMsg(err)}`)
+    }
+    return taken
+  }
+
+  /** Watcher tick of a running session: claim new folder-inbox rows, take the ones others claimed. */
+  async pollFolderInbox(): Promise<void> {
+    if (this.cfg.dryRun || !this.deps.api || this.cfg.errors.length > 0 || this.inboxPolling) return
+    this.inboxPolling = true
+    try {
+      await this.claimInbox({ tick: true })
+    } catch (err) {
+      this.deps.log(`inbox poll: ${errMsg(err)}`)
+    } finally {
+      this.inboxPolling = false
+    }
+    await this.receiveBroadcasts()
+  }
+
+  /** Count this session as running in its folder (the claimer hands messages to it). */
+  private registerSession(): void {
+    try {
+      this.deps.sessions.register(this.deps.pid, this.nowIso())
+    } catch (err) {
+      this.deps.log(`could not register the session in its folder: ${errMsg(err)}`)
+    }
   }
 
   /** Rows whose claim the dashboard refused with 409 (per folder, newest SKIPPED_MAX kept). */
@@ -1053,10 +1162,10 @@ export class CcLink {
   /** Start the answer watcher and the outbox flusher (unref'd: they never keep the process alive). */
   startBackground(): void {
     if (this.cfg.errors.length > 0 || this.cfg.dryRun) return
-    const poll = setInterval(
-      () => void this.pollOwnAsks().catch(e => this.deps.log(`poll: ${errMsg(e)}`)),
-      this.cfg.pollSec * 1000,
-    )
+    const poll = setInterval(() => {
+      void this.pollOwnAsks().catch(e => this.deps.log(`poll: ${errMsg(e)}`))
+      void this.pollFolderInbox().catch(e => this.deps.log(`inbox poll: ${errMsg(e)}`))
+    }, this.cfg.pollSec * 1000)
     const flush = setInterval(() => void this.flushOutbox(), this.cfg.flushSec * 1000)
     poll.unref()
     flush.unref()
@@ -1066,6 +1175,7 @@ export class CcLink {
   stopBackground(): void {
     for (const t of this.timers) clearInterval(t)
     this.timers = []
+    this.deps.sessions.unregister(this.deps.pid)
   }
 }
 
@@ -1105,6 +1215,8 @@ export function createLink(config: Config, opts: CreateLinkOptions = {}): CcLink
     outbox: new Outbox(join(config.stateDir, 'outbox'), { now, lock: { isAlive, pid, bootMs, ...opts.lock } }),
     asks: asksFor(identity.folderKey),
     asksFor,
+    sessions: new SessionRegistry(config.stateDir, identity.folderKey),
+    broadcast: new BroadcastStore(config.stateDir, identity.folderKey, lock),
     pid,
     now,
     isAlive,
