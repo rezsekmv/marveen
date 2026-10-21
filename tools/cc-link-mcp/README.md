@@ -308,6 +308,82 @@ know about. At most 10 lines, no secrets, no code blocks. Then call the
 
 To check for a reply later, call `agent_reply` with the id it returned.
 
+## Session sync (optional)
+
+`sync/sync.py` keeps the main agent informed without anyone remembering to
+send a summary. Run hourly (launchd on macOS), it:
+
+1. finds sessions whose transcript (`~/.claude/projects/*/*.jsonl`) has new
+   entries since the last summary and none for `CC_LINK_SYNC_IDLE_MIN`
+   minutes (default 30; measured from the newest entry's timestamp, since
+   the file mtime can change without new entries),
+2. extracts the user prompts and assistant prose of the new part (tool calls
+   and results are dropped) and has `claude -p` summarize it and send it with
+   `<prefix>_message` (`sync/summary-brief.md`), or skip trivial sessions,
+3. answers the main agent's questions about those sessions (below).
+
+Long sessions are summarized in parts: each run covers only what happened
+since the previous summary, marked `continued` in the header.
+
+When the dashboard is unreachable (`GET /api/auth/whoami` fails, e.g. away
+from the LAN), the run exits before calling any model; the next run catches up.
+
+### Install
+
+```bash
+mkdir -p ~/.cc-link/sync
+sed -e "s#__HOME__#$HOME#g" \
+    -e "s#__SYNC_PY__#$PWD/sync/sync.py#" \
+    -e "s#__AGENT_NAME__#<your CC_LINK_AGENT_NAME>#" \
+    sync/cc-link-sync.plist.template > ~/Library/LaunchAgents/cc-link.session-sync.plist
+# edit CC_LINK_SYNC_LANG / _SINCE / _CATEGORIES in the plist, then:
+python3 sync/sync.py --dry-run     # lists what would be sent, sends nothing
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/cc-link.session-sync.plist
+```
+
+Set `CC_LINK_SYNC_SINCE` (YYYY-MM-DD) on the first install, or the first run
+summarizes every transcript still on disk. The dashboard URL and device key
+are read from the `cc-link` entry in `~/.claude.json` (the user-scope
+registration above); the plist holds no secret. After changing the plist:
+`launchctl bootout gui/$(id -u)/cc-link.session-sync`, then bootstrap again.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CC_LINK_AGENT_NAME` | `agent` | tool prefix; must match the MCP server env |
+| `CC_LINK_SYNC_DIR` | `~/.cc-link/sync` | state directory |
+| `CC_LINK_SYNC_LANG` | `English` | language of summaries and answers |
+| `CC_LINK_SYNC_MODEL` | `sonnet` | model for summaries and answers |
+| `CC_LINK_SYNC_SINCE` | unset | ignore transcript entries before this date |
+| `CC_LINK_SYNC_CATEGORIES` | unset | `LABEL=path` pairs, comma separated, e.g. `WORK=~/code/work,OSS=~/code/oss`; the label goes into the header, `OTHER` when no path matches |
+| `CC_LINK_SYNC_IDLE_MIN` | `30` | minutes without new entries before a session is summarized |
+
+State in `CC_LINK_SYNC_DIR`: `sent.tsv` (session id, date, category,
+`sent`/`skipped`, message id, transcript lines covered), `answered.txt`,
+`sync.log`, and `run/`, the working directory of every `claude -p` call. Its
+own transcripts are never summarized.
+
+### Questions about a session: SYNC-Q / SYNC-A
+
+Every summary starts with
+`[SYNC] [<category>] <folder> · <date> · session:<id8>` and is sent from
+`run/`, so its folder key is the address for follow-up questions. `--dry-run`
+prints it (`questions go to folder:<key>`).
+
+- The main agent sends a **folder message** to `folder:<key>` that mentions
+  `session:<id8>` (e.g. `[SYNC-Q] session:1a2b3c4d – what is still open?`).
+  A plain reply to a summary would go to the `claude -p` process that sent
+  it, which is gone by then.
+- The next run claims it (a short `claude -p` that calls `<prefix>_inbox`),
+  loads the referenced transcripts and answers with `<prefix>_message`
+  (`sync/answer-brief.md`). The answer starts with
+  `[SYNC-A] ref:<message id> session:<id8>`.
+- Without a session reference, or when the transcript does not answer it,
+  the reply says what is missing (then ask the user). Acknowledgements get
+  no reply. Handled ids go to `answered.txt`.
+
+Answers come only from the transcripts; the model gets no other tool than
+`<prefix>_message`. Self-check of the helpers: `python3 sync/test_sync.py`.
+
 ## On the mini
 
 1. Mint a device key with the dashboard token (the raw key is shown once).
