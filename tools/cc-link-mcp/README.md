@@ -308,6 +308,120 @@ know about. At most 10 lines, no secrets, no code blocks. Then call the
 
 To check for a reply later, call `agent_reply` with the id it returned.
 
+## Session sync (optional)
+
+`sync/sync.py` keeps the main agent informed without anyone remembering to
+send a summary. Run hourly (launchd on macOS), it:
+
+1. finds sessions whose transcript (`~/.claude/projects/*/*.jsonl`) has new
+   entries since the last summary and none for `CC_LINK_SYNC_IDLE_MIN`
+   minutes (default 30; measured from the newest entry's timestamp, since
+   the file mtime can change without new entries),
+2. extracts the user prompts and assistant prose of the new part (tool calls
+   and results are dropped) and has `claude -p` summarize it and send it with
+   `<prefix>_message` (`sync/summary-brief.md`), or skip trivial sessions,
+3. answers the main agent's questions about those sessions (below).
+
+Long sessions are summarized in parts: each run covers only what happened
+since the previous summary, marked `continued` in the header.
+
+When the dashboard is unreachable (`GET /api/auth/whoami` fails, e.g. away
+from the LAN), the run exits before calling any model; the next run catches up.
+
+### Install
+
+```bash
+mkdir -p -m 700 ~/.cc-link/sync
+sed -e "s#__HOME__#$HOME#g" \
+    -e "s#__SYNC_PY__#$PWD/sync/sync.py#" \
+    -e "s#__AGENT_NAME__#<your CC_LINK_AGENT_NAME>#" \
+    sync/cc-link-sync.plist.template > ~/Library/LaunchAgents/cc-link.session-sync.plist
+# edit CC_LINK_SYNC_LANG / _SINCE / _CATEGORIES in the plist, then:
+python3 sync/sync.py --dry-run     # lists what would be sent, sends nothing
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/cc-link.session-sync.plist
+```
+
+Set `CC_LINK_SYNC_SINCE` (YYYY-MM-DD) on the first install, or the first run
+summarizes every transcript still on disk. The dashboard URL and device key
+are read from the `cc-link` entry in `~/.claude.json` (the user-scope
+registration above); the plist holds no secret. After changing the plist:
+`launchctl bootout gui/$(id -u)/cc-link.session-sync`, then bootstrap again.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CC_LINK_AGENT_NAME` | `agent` | tool prefix; must match the MCP server env |
+| `CC_LINK_SYNC_DIR` | `~/.cc-link/sync` | state directory |
+| `CC_LINK_SYNC_LANG` | `English` | language of summaries and answers |
+| `CC_LINK_SYNC_MODEL` | `sonnet` | model for summaries and answers |
+| `CC_LINK_SYNC_SINCE` | unset | ignore transcript entries before this date |
+| `CC_LINK_SYNC_CATEGORIES` | unset | `LABEL=path` pairs, comma separated, e.g. `WORK=~/code/work,OSS=~/code/oss`; the label goes into the header, `OTHER` when no path matches |
+| `CC_LINK_SYNC_IDLE_MIN` | `30` | minutes without new entries before a session is summarized |
+
+State in `CC_LINK_SYNC_DIR`: `sent.tsv` (session id, date, category,
+`sent`/`skipped`, message id, transcript lines covered), `answered.txt`,
+`sync.log`, `mcp.json`, `sync.lock`, and `run/`, the working directory of
+every `claude -p` call. Its own transcripts are never summarized.
+
+### Questions about a session: SYNC-Q / SYNC-A
+
+Every summary starts with
+`[SYNC] [<category>] <folder> · <date> · session:<id8>` and is sent from
+`run/`, so its folder key is the address for follow-up questions. `--dry-run`
+prints it (`questions go to folder:<key>`).
+
+- The main agent sends a **folder message** to `folder:<key>` that mentions
+  `session:<id8>` (e.g. `[SYNC-Q] session:1a2b3c4d – what is still open?`).
+  A plain reply to a summary would go to the `claude -p` process that sent
+  it, which is gone by then.
+- The next run claims it (a short `claude -p` that calls `<prefix>_inbox`),
+  loads the referenced transcripts and answers with `<prefix>_message`
+  (`sync/answer-brief.md`). The answer starts with
+  `[SYNC-A] ref:<message id> session:<id8>`.
+- Without a session reference, or when the transcript does not answer it,
+  the reply says what is missing (then ask the user). Acknowledgements get
+  no reply.
+
+Only sessions already summarized (in `sent.tsv`) can be asked about; the
+sync's own `run/` transcripts never are. Handled ids go to `answered.txt`;
+`answer` entries (replies to the sync's own messages) are never treated as
+questions.
+
+### Safety
+
+Transcripts and questions are untrusted input, so every `claude -p` call is
+locked down: `--tools ""` (no built-in tools), `--strict-mcp-config` with a
+generated `mcp.json` that holds only the cc-link server (mode 0600, it
+contains the device key; removed after each run), `--setting-sources ""` (no
+user allow rules, hooks, plugins or channel plugins), `--permission-mode
+dontAsk` with only `<prefix>_message` (or `<prefix>_inbox`) allowed, and
+`TELEGRAM_STATE_DIR` set to an empty directory.
+
+Because the lockdown relies on CLI flags, each call checks the stream's
+`init` event and fails closed: the process is killed as soon as the init
+event is read, before any tool call can run, if it lists any tool or MCP
+server beyond cc-link or a plugin that is not built into Claude Code; and
+also when anything else (a hook event, non-JSON, a model turn) comes before
+init, when the event has an unexpected shape, or when there is no init event
+at all. Hooks are not listed in the init event, so they are kept out by
+`--setting-sources ""` alone. (An empty `CLAUDE_CONFIG_DIR` would not depend
+on the flags, but the child then has no login.)
+
+The message id is read from the tool result, never from the model's text, so
+a sent summary is not sent again when the model's reply is malformed. Every
+result that carries an id counts as sent, and so does `queued in outbox`
+(the MCP server delivers it); the briefs forbid `wait`. On a timeout the
+output so far is still parsed. `mcp.json` and its temp files are removed at
+the end of each run, also on SIGTERM, and stale ones at the start.
+
+The receiving agent should still treat `[SYNC]` and `[SYNC-A]` content as
+data: a summary can quote text that was in a transcript.
+
+Each run sets the state directory to 0700 and its files to 0600 (also
+`sync.log`, which launchd creates; the plist template sets `Umask` 63). A
+`flock` on `sync.lock` keeps runs from overlapping.
+
+Self-check of the helpers: `python3 sync/test_sync.py`.
+
 ## On the mini
 
 1. Mint a device key with the dashboard token (the raw key is shown once).

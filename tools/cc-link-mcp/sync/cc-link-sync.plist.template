@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for sync.py. Fill in the placeholders (see README "Session sync"):
+    __HOME__        your home directory, e.g. /Users/alice
+    __SYNC_PY__     absolute path of tools/cc-link-mcp/sync/sync.py
+    __AGENT_NAME__  the same CC_LINK_AGENT_NAME as in the MCP server env
+  The PATH must contain the directory of the `claude` binary.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>cc-link.session-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__SYNC_PY__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>CC_LINK_AGENT_NAME</key><string>__AGENT_NAME__</string>
+    <key>CC_LINK_SYNC_LANG</key><string>English</string>
+    <key>CC_LINK_SYNC_SINCE</key><string></string>
+    <key>CC_LINK_SYNC_CATEGORIES</key><string></string>
+  </dict>
+  <key>WorkingDirectory</key><string>__HOME__/.cc-link/sync</string>
+  <key>Umask</key><integer>63</integer>  <!-- 077: sync.log is created by launchd -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/.cc-link/sync/sync.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.cc-link/sync/sync.log</string>
+</dict>
+</plist>
