@@ -1,5 +1,5 @@
 /**
- * Pure secret scanner. Runs on every tony_note text / tony_ask question BEFORE
+ * Pure secret scanner. Runs on every <prefix>_message text BEFORE
  * anything is queued or sent. Returns pattern NAMES only, never the matched
  * value, so the error message itself cannot leak the secret.
  *

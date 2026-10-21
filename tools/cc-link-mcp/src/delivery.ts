@@ -23,6 +23,12 @@ export interface AskRecord {
    * not judged dead just because it was created before the reboot.
    */
   ownedSince?: string
+  /**
+   * Sent without wait: nobody waits for an answer. Still watched (an answer is
+   * pushed like any other), but closing it without an answer, or expiry, is
+   * settled silently.
+   */
+  quiet?: boolean
 }
 
 /**
@@ -116,7 +122,7 @@ export function selectInbox(rows: readonly MessageRow[], ctx: InboxContext): Mes
   return dedupeSorted(rows.filter(r => isInboxCandidate(r, ctx) && isForFolder(r, ctx.folderKey)))
 }
 
-/** Candidates with no folder marker at all: never claimed, only listed by tony_inbox. */
+/** Candidates with no folder marker at all: never claimed, only listed by the inbox tool. */
 export function selectUnaddressed(rows: readonly MessageRow[], ctx: Pick<InboxContext, 'senderId' | 'mainAgentId'>): MessageRow[] {
   return dedupeSorted(rows.filter(r => isInboxCandidate(r, ctx) && !hasAnyFolderKeyToken(r.origin_note)))
 }
@@ -202,7 +208,7 @@ export function isAskExpired(ask: Pick<AskRecord, 'createdAt'>, nowMs: number, m
   return Number.isFinite(t) && nowMs - t > maxAgeMs
 }
 
-/** One-line preview of a question for asks.json / tony_inbox. */
+/** One-line preview of a message for asks.json / the inbox tool. */
 export function makePreview(text: string, max = 80): string {
   const flat = text.replace(/\s+/g, ' ').trim()
   return flat.length <= max ? flat : flat.slice(0, max - 1) + '…'

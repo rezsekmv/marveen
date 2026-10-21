@@ -99,3 +99,21 @@ jobs:
       # a throwaway install root, stand-in python and node gates, a local stub for
       # the alert POST.
       - run: python3 scripts/__tests__/hook-load-watch.test.py
+
+  # Q d8f70bb3 low 5: tools/cc-link-mcp is a bun project with its own lockfile,
+  # and the root vitest run excludes it, so without this job a green PR said
+  # nothing about the cc-link suite. `test:cc-link` installs with
+  # --frozen-lockfile (a drifted bun.lock fails here, not on a laptop) and runs
+  # bun test plus its own tsc. Bun is pinned to the version the lockfile was
+  # written with; bump it together with bun.lock.
+  cc-link:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # Third-party action pinned to a commit (v2.2.0), not a movable tag.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.3
+      - run: npm run test:cc-link
