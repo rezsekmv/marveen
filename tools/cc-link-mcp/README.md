@@ -328,7 +328,10 @@ To check for a reply later, call `agent_reply` with the id it returned.
 ### How the main agent answers
 
 A message is a row from `<sender-id>` to the main agent. The main agent answers
-(any message, waited for or not) by closing that row with the answer in `result`:
+(any message, waited for or not) by closing that row with the answer in `result`.
+Every non-empty `result` reaches the laptop session as an answer, so close a
+summary that needs no answer WITHOUT a `result` (an acknowledgement such as
+"noted" would be pushed back as an answer):
 
 ```bash
 curl -s -X PUT https://<mini-host>:3420/api/messages/<id> \
@@ -390,7 +393,9 @@ lockfile's version, frozen lockfile).
   `<prefix>_message(text, wait?)`, and every tool name now takes its prefix
   from `CC_LINK_AGENT_NAME` (default `agent`). Set it in the server's env to
   keep a familiar prefix, and update permission allowlists and slash commands
-  to the new names. Outbox items queued by the old build are sent unchanged.
+  to the new names (a call to an old name, e.g. `tony_reply` on an `agent_`
+  install, answers with the right name). Outbox items queued by the old build
+  are sent unchanged.
 - **Let the outbox drain before upgrading cc-link.** `agent_inbox` (and every
   tool result's status line) shows how many items are waiting. Items queued
   by builds from before the ref-token change carry no token, so after the
@@ -439,6 +444,10 @@ lockfile's version, frozen lockfile).
   dashboard (one that does not report `failed_by`) is not asked again on every
   startup, while a new row that reuses the id, or another dashboard, is not
   affected.
+- The answer watcher reads each tracked message by id once per
+  `CC_LINK_POLL_SEC`; messages sent without `wait` are tracked too, so a
+  session that sends many of them makes that many GETs per tick until the
+  main agent closes them (or 7 days pass).
 - The outbox is flushed before every tool call. When the mini is offline and
   items are waiting, each tool call can take up to 10 s longer (the request
   timeout).

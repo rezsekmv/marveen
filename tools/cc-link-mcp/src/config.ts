@@ -101,11 +101,6 @@ export function parseBaseUrl(raw: string): { url: string } | { error: string } {
   return { url }
 }
 
-/** Validate an http(s) URL and strip trailing slashes. Returns undefined when invalid. */
-export function normalizeBaseUrl(raw: string): string | undefined {
-  const r = parseBaseUrl(raw)
-  return 'url' in r ? r.url : undefined
-}
 
 function positiveInt(
   env: Record<string, string | undefined>,

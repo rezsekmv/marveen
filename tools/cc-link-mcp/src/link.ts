@@ -541,6 +541,15 @@ export class CcLink {
           `no wait = a note, wait=true = a question that waits for the answer.`,
       )
     }
+    // Same tool, other prefix: typically an allowlist or slash command from before CC_LINK_AGENT_NAME changed.
+    const t = this.tools
+    const same = [t.message, t.reply, t.inbox].find(n => name.endsWith(n.slice(this.cfg.toolPrefix.length)))
+    if (same) {
+      return new ToolError(
+        `unknown tool: ${name}. This server's tools use the prefix ${this.cfg.toolPrefix}_ ` +
+          `(CC_LINK_AGENT_NAME); did you mean ${same}?`,
+      )
+    }
     return new ToolError(`unknown tool: ${name}`)
   }
 
@@ -765,11 +774,18 @@ export class CcLink {
     const all = this.deps.asks.read()
     const mine = ownAsks(all, this.deps.pid).filter(a => !this.settled.has(a.id))
     for (const p of this.pendingTrack.values()) if (!mine.some(a => a.id === p.id)) mine.push(p)
-    if (mine.length === 0) {
-      lines.push('sent messages waiting for an answer: none')
+    // Questions (wait=true) first; messages sent without wait are only watched in case an answer comes.
+    const waiting = mine.filter(a => !a.quiet)
+    const quiet = mine.filter(a => a.quiet)
+    if (waiting.length === 0) {
+      lines.push('questions waiting for an answer: none')
     } else {
-      lines.push(`sent messages waiting for an answer (${mine.length}):`)
-      for (const a of mine) lines.push(`- id ${a.id} (sent ${a.createdAt}): ${a.preview}`)
+      lines.push(`questions waiting for an answer (${waiting.length}):`)
+      for (const a of waiting) lines.push(`- id ${a.id} (sent ${a.createdAt}): ${a.preview}`)
+    }
+    if (quiet.length > 0) {
+      lines.push(`messages sent without wait, not closed yet (${quiet.length}; an answer is pushed if one comes):`)
+      for (const a of quiet) lines.push(`- id ${a.id} (sent ${a.createdAt}): ${a.preview}`)
     }
     const others = all.filter(a => a.pid !== this.deps.pid).length
     if (others > 0) {

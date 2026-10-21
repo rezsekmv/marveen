@@ -92,6 +92,30 @@ describe('tool-name prefix (CC_LINK_AGENT_NAME)', () => {
   })
 })
 
+describe('upgrade hints and inbox listing (Q review of #1)', () => {
+  let h: Harness
+  beforeEach(() => (h = makeHarness()))
+  afterEach(() => h.cleanup())
+
+  test('a tool name with another prefix answers with the right name (old allowlist / slash command)', async () => {
+    const s = makeLink(h, { pid: 7401 })
+    const r = await s.link.callTool('acme_reply', { id: 1 })
+    expect(r.isError).toBe(true)
+    expect(r.text).toContain('prefix agent_ (CC_LINK_AGENT_NAME); did you mean agent_reply?')
+    expect(h.dash.calls).toEqual([])
+  })
+
+  test('agent_inbox lists questions and no-wait messages separately', async () => {
+    h.alive.add(7402)
+    const s = makeLink(h, { pid: 7402, env: { CC_LINK_ASK_WAIT_SEC: '3' } })
+    const q = idFrom((await s.link.callTool('agent_message', { text: 'a question', wait: true })).text)
+    const n = idFrom((await s.link.callTool('agent_message', { text: 'a summary' })).text)
+    const inbox = (await s.link.callTool('agent_inbox')).text
+    expect(inbox).toContain(`questions waiting for an answer (1):\n- id ${q} `)
+    expect(inbox).toContain(`messages sent without wait, not closed yet (1; an answer is pushed if one comes):\n- id ${n} `)
+  })
+})
+
 describe('agent_message without wait (the old note)', () => {
   let h: Harness
   beforeEach(() => (h = makeHarness()))
