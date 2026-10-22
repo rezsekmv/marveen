@@ -470,7 +470,7 @@ describe('README: security round', () => {
   })
 })
 
-describe('Q re-review: placeholder forms exempt only as the whole value', () => {
+describe('security re-review: placeholder forms exempt only as the whole value', () => {
   // Fixtures assembled at runtime (the pre-commit secret gate scans staged files).
   const kv = (k: string, v: string) => `${k}=${v}`
   test.each([

@@ -4206,7 +4206,7 @@ export function claimPendingForAgent(toAgent: string, limit: number): AgentMessa
 // exactly as it was. First closer wins. (One narrow exception, failed -> done
 // on a row the router failed for a delivery reason: markRouterFailedMessageDone.)
 //
-// Why (Q re-review of cc-link, M1): unguarded, the same row could be closed
+// Why (security re-review of cc-link, M1): unguarded, the same row could be closed
 // again and again, and every PUT close wrote a fresh [Eredmény] row to the
 // delegator -- so one credential could repeat a server-written message to the
 // main agent at will. The same race also let the router's abandon branch flip

@@ -141,7 +141,7 @@ describe('folder messages to running sessions', () => {
     expect(existsSync(join(reg.dir, '3.json'))).toBe(false)
   })
 
-  // Q review of #2, medium 1.
+  // Security review of #2, medium 1.
   test('a tool call and a tick that overlap push a handed-out entry once', async () => {
     const a = await running(9081)
     const b = await running(9082)
@@ -152,7 +152,7 @@ describe('folder messages to running sessions', () => {
     expect(b.link.received.length).toBe(1)
   })
 
-  // Q review of #2, medium 2.
+  // Security review of #2, medium 2.
   test('same-boot pid reuse after an unclean exit: the new session gets nothing old, the entry is pruned', async () => {
     const a = await running(9091)
     await running(9092)

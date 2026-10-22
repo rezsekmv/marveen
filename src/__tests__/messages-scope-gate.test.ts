@@ -412,7 +412,7 @@ describe('isReservedSenderId, shared by mint and every use', () => {
   })
 })
 
-describe('closing a message (Q re-review M1)', () => {
+describe('closing a message (security re-review M1)', () => {
   const reverseRows = (id: number) =>
     (getDb().prepare('SELECT COUNT(*) AS c FROM agent_messages WHERE content LIKE ?').get(`${COMPLETION_REPORT_PREFIX} msg_id:${id} %`) as { c: number }).c
 
@@ -469,7 +469,7 @@ describe('closing a message (Q re-review M1)', () => {
   })
 })
 
-describe('a late real done on a row the ROUTER failed (Q final review M1)', () => {
+describe('a late real done on a row the ROUTER failed (final security review M1)', () => {
   const reverseRows = (id: number) =>
     (getDb().prepare('SELECT COUNT(*) AS c FROM agent_messages WHERE content LIKE ?').get(`${COMPLETION_REPORT_PREFIX} msg_id:${id} %`) as { c: number }).c
   const rowOf = (id: number) => getDb().prepare('SELECT status, result FROM agent_messages WHERE id = ?').get(id) as { status: string; result: string | null }

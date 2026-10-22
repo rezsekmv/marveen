@@ -7,7 +7,7 @@
 // markRouterFailedMessageDone). Deliberately dependency-free so db.ts can
 // import it without pulling in the router.
 //
-// Why a router failure is not final (Q final review of cc-link, M1): the
+// Why a router failure is not final (final security review of cc-link, M1): the
 // status guard made every terminal row immutable, but these three are the
 // router's GUESS that nobody got the row, and the guess can be wrong:
 //   - inject give-up: sendPromptToSession can throw although the text reached
