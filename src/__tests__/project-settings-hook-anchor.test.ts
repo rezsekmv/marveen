@@ -76,6 +76,8 @@ const EXPECTED: Record<string, string[]> = {
     'email-approval-gate.py @ .*manage_email.*',
     'email-approval-gate.py @ .*[Gg]mail.*__.*',
     'email-approval-gate.py @ .*draft_email.*',
+    // DEVKEYGATE1022: always on, the main agent included (sub-agents get it from the scaffold).
+    'device-keys-gate.py @ Bash|Write|Edit|MultiEdit|NotebookEdit',
     'channel-image-resize.sh @ Read', 'egress-gate.mjs @ WebFetch', 'memory-frontmatter-gate.py @ Write|Edit|MultiEdit',
     'memory-frontmatter-bash-gate.py @ Bash',
   ],
