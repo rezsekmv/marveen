@@ -884,6 +884,9 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   if (agentGetsDestructiveGate(name, profile)) injectDestructiveGate(existing)
   if (agentGetsCredentialGate(name, profile)) injectCredentialGate(existing)
   injectEgressGate(existing)
+  // DEVKEYGATE1022: no predicate, no profile switch. Every agent gets it; the
+  // main agent's copy is the entry in the repo-shipped .claude/settings.json.
+  injectDeviceKeysGate(existing)
   if (agentGetsBashEgressParser(name)) injectBashEgressParser(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
@@ -1537,6 +1540,62 @@ export function ensureChildClaudeGuard(name: string): boolean {
   return true
 }
 
+// DEVKEYGATE1022: the device_keys write gate (scripts/hooks/device-keys-gate.py).
+// A 'messages'-scope device key bound to the voice sender is the provenance
+// proof the voice path trusts, and the only way left to mint one is the
+// direct-SQLite `voice-relay-key mint` CLI -- which any agent with a shell
+// could run, or bypass by writing device_keys / replacing the DB file. The gate
+// blocks those three shapes on Bash and the file tools onto the DB path.
+//
+// ALWAYS ON, for EVERY agent, the main one included -- deliberately unlike the
+// destructive and credential gates, which are profile opt-ins. Those encode an
+// operator's process ("may this agent delete?"), which differs per install;
+// this one protects an invariant of this software (who may create a provenance
+// key), which does not. There is also no agent-reachable override (see the
+// script header): the mint is a human's act in a terminal outside any agent.
+//
+// Two surfaces, one per kind of agent, because the main agent's settings path
+// is the shared user-scope ~/.claude/settings.json (#1305: no scaffold write may
+// land there):
+//   - sub-agents: injectDeviceKeysGate on every render + the boot migration in
+//     ensureGovernanceGateCommands, so an already-running fleet converges;
+//   - the main agent: the tracked .claude/settings.json entry, in the same
+//     fail-closed $CLAUDE_PROJECT_DIR form as its other governance gates.
+// Sub-agents run with cwd agents/<name>, so they never load the repo-root
+// project settings: the two surfaces do not double-run the gate.
+export const DEVICE_KEYS_GATE_SCRIPT = 'device-keys-gate.py'
+// Bash carries the mint, the SQL and the shell overwrite; the file tools are
+// the second route to overwriting the DB file itself.
+export const DEVICE_KEYS_GATE_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit'
+
+// Pure, and true for every name on purpose: the gate has no exempt agent. Kept
+// as a predicate so the "every agent, main included" guarantee is a tested
+// statement rather than the absence of an `if`.
+export function agentGetsDeviceKeysGate(_name: string): boolean {
+  return true
+}
+
+// Same dedupe discipline as injectDestructiveGate: drop every prior entry that
+// carries this script (whatever its matcher) and re-add the canonical one, so a
+// stale matcher can never leave a gate that silently never fires.
+export function injectDeviceKeysGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = pythonHookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'device-keys-gate.py'))
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: DEVICE_KEYS_GATE_MATCHER,
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes(DEVICE_KEYS_GATE_SCRIPT)),
+    entry,
+  ]
+}
+
 // Idempotently wire the destructive-gate PreToolUse hook.
 //
 // WHY THIS LIVES IN CODE AND NOT IN settings.json (card a14ea5c7): the gate was
@@ -2061,13 +2120,22 @@ export function ensureGovernanceGateCommands(name: string, profile?: ProfileTemp
     && (e as { matcher?: unknown })?.matcher !== EMAIL_GATE_MATCHER)
   const needCredential = agentGetsCredentialGate(name, profile)
     && (!hookCommandWired(ptuJson, credentialCmd) || credentialStale)
-  if (!needEmail && !needPace && !needDestructive && !needCredential) return false
+  // DEVKEYGATE1022: no opt-in, so this is what brings the gate to every
+  // already-scaffolded sub-agent at the next boot. Same three failure modes as
+  // the destructive gate: missing, a stale command, a stale matcher.
+  const deviceKeysCmd = pythonHookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'device-keys-gate.py'))
+  const deviceKeysStale = ptu.some((e) => JSON.stringify(e).includes(DEVICE_KEYS_GATE_SCRIPT)
+    && (e as { matcher?: unknown })?.matcher !== DEVICE_KEYS_GATE_MATCHER)
+  const needDeviceKeys = agentGetsDeviceKeysGate(name)
+    && (!hookCommandWired(ptuJson, deviceKeysCmd) || deviceKeysStale)
+  if (!needEmail && !needPace && !needDestructive && !needCredential && !needDeviceKeys) return false
   // The injectors dedupe by script basename, so a stale bare-`node` entry is
   // replaced in place rather than accumulated.
   if (needEmail) injectEmailSendGate(settings, threadReply)
   if (needPace) injectSelfPaceGate(settings)
   if (needDestructive) injectDestructiveGate(settings)
   if (needCredential) injectCredentialGate(settings)
+  if (needDeviceKeys) injectDeviceKeysGate(settings)
   atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
   return true
 }
