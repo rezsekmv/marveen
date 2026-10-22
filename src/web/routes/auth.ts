@@ -52,7 +52,7 @@ import {
   MESSAGES_KEY_MAX_EXPIRY_DAYS,
   type DeviceKeyScope,
 } from '../auth-device-keys.js'
-import { validateMessagesSenderId } from '../messages-gate.js'
+import { validateMessagesSenderId, isVoiceRelayBinding } from '../messages-gate.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { MAIN_AGENT_ID, SYSTEM_SENDER_IDS, parseSystemSenderIds } from '../../config.js'
 import { removeBridgeSshAccess, sshDirOverride } from '../bridge-enroll.js'
@@ -429,6 +429,28 @@ export async function tryHandleAuth(ctx: RouteContext): Promise<boolean> {
         return true
       }
       senderId = (body.sender_id as string).trim()
+      // VOICEPROV1022: a messages key bound to the voice id is the ONE credential
+      // that can write from=<voice id> (routes/messages.ts), and the provenance
+      // gate reads that row back as proof the voice relay sent the prompt. So
+      // this binding is NEVER minted over HTTP, by any principal.
+      //
+      // WHY NOT EVEN A SESSION: every HTTP lane traces back to the shared
+      // dashboard token, which every sub-agent can read. The token may create a
+      // dashboard user (POST /api/auth/users) with a password of its choosing,
+      // log in as it, and hold a session -- the security review of PR #4 walked exactly
+      // that path to a hanna-bound key. A device key is minted by a token or a
+      // session, so it is no better. The one credential the token cannot reach
+      // over HTTP is a shell on the host, so the binding is minted there:
+      // `npm run voice-relay-key -- mint` (scripts/voice-relay-key.ts). That is
+      // the same ceiling as the residual the gate documents (direct writes to
+      // store/claudeclaw.db by the same Unix user). This route is the only HTTP
+      // path that creates a sender binding: keys are never re-scoped or
+      // re-bound after mint, and bridge-enroll mints full keys.
+      if (isVoiceRelayBinding(senderId)) {
+        logger.warn({ authKind: auth?.kind, senderId }, 'Rejected voice relay messages key mint over HTTP')
+        json(res, { error: 'the voice relay key is never minted over HTTP (every HTTP credential traces back to the shared token); mint it on the host: npm run voice-relay-key -- mint --out <path>' }, 403)
+        return true
+      }
     } else if (body.sender_id !== undefined) {
       // A sender on a full/operator key would be a field nothing enforces;
       // refusing it keeps the binding meaningful wherever it appears.

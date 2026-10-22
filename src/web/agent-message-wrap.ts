@@ -186,8 +186,10 @@ export function wrapAgentMessageForDelivery(
     // inter-agent instructions.
     // HANGPREAMBLE1013: the voice channel replies through its pull mailbox, not
     // a channel reply tool, so it gets its own preamble naming that route.
+    // VOICEPROV1022: the voice header carries the row id, so the provenance
+    // gate can read the row back instead of flagging every dictated request.
     const preamble = safeFrom === VOICE_CHANNEL_AGENT_ID
-      ? voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID)
+      ? voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, msgId)
       : CHANNEL_INBOUND_PREAMBLE
     return { wrapped: wrapChannelInbound(content), prefix: `${preamble}\n` }
   }

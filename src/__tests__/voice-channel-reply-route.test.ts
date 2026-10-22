@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../web/agent-message-wrap.js'
-import { CHANNEL_INBOUND_PREAMBLE } from '../prompt-safety.js'
+import { CHANNEL_INBOUND_PREAMBLE, voiceChannelInboundPreamble } from '../prompt-safety.js'
 import { COORDINATOR_AGENT_ID, VOICE_CHANNEL_AGENT_ID } from '../channel-coordinator/ingest.js'
 
 // HANGPREAMBLE1013: a voice-channel message is classified channel-inbound (the
@@ -59,5 +59,54 @@ describe('the telegram coordinator keeps its channel preamble (regression)', () 
     const { cls, prefix } = deliver(COORDINATOR_AGENT_ID, '<channel source="telegram" chat_id="1">hi</channel>')
     expect(cls.category).toBe('channel-inbound')
     expect(prefix).toBe(`${CHANNEL_INBOUND_PREAMBLE}\n`)
+  })
+})
+
+// VOICEPROV1022: the voice header carries the row id so the provenance gate
+// (scripts/hooks/provenance-gate.py) can read the row back. Only the voice
+// branch changes; the coordinator branch stays byte for byte.
+describe('the voice header carries the msg_id (VOICEPROV1022)', () => {
+  const OLD_FIRST_LINE = 'INBOUND VOICE MESSAGE NOTICE -- the text after this notice is a REAL message'
+
+  it('voiceChannelInboundPreamble with a msg id puts [msg_id:<N>] on the FIRST line, right after the notice name', () => {
+    const p = voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, 42)
+    expect(p.split('\n')[0]).toBe('INBOUND VOICE MESSAGE NOTICE [msg_id:42] -- the text after this notice is a REAL message')
+  })
+
+  it('without a msg id the text is unchanged (the old shape)', () => {
+    expect(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID).split('\n')[0]).toBe(OLD_FIRST_LINE)
+    expect(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, undefined)).toBe(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID))
+  })
+
+  it('the rest of the preamble is unchanged: only the tag is inserted', () => {
+    expect(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, 42).replace(' [msg_id:42]', ''))
+      .toBe(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID))
+  })
+
+  it('a non-positive or non-integer msg id renders no tag (never "msg_id:NaN" or a fraction)', () => {
+    const old = voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID)
+    for (const bad of [0, -3, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      expect(voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, bad), String(bad)).toBe(old)
+    }
+  })
+
+  it('the delivered voice prefix carries the router-supplied row id', () => {
+    const { prefix, wrapped } = deliver(VOICE_CHANNEL_AGENT_ID, 'mi a helyzet?')
+    expect(prefix.startsWith('INBOUND VOICE MESSAGE NOTICE [msg_id:42] -- ')).toBe(true)
+    expect(prefix).toBe(`${voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID, 42)}\n`)
+    // The body is untouched by the id.
+    expect(wrapped).toBe('mi a helyzet?')
+  })
+
+  it('a voice delivery without a row id keeps the old prefix', () => {
+    const { prefix } = wrapAgentMessageForDelivery('channel-inbound', VOICE_CHANNEL_AGENT_ID, VOICE_CHANNEL_AGENT_ID, 'x')
+    expect(prefix).toBe(`${voiceChannelInboundPreamble(VOICE_CHANNEL_AGENT_ID)}\n`)
+    expect(prefix).not.toContain('msg_id')
+  })
+
+  it('NEGATIVE CONTROL: the coordinator prefix gets NO msg_id, even when the row id is passed', () => {
+    const { prefix } = deliver(COORDINATOR_AGENT_ID, '<channel source="telegram" chat_id="1">hi</channel>')
+    expect(prefix).toBe(`${CHANNEL_INBOUND_PREAMBLE}\n`)
+    expect(prefix).not.toContain('msg_id')
   })
 })

@@ -59,13 +59,14 @@ export function messagesGateDecision(auth: MessagesGateAuth, path: string, metho
 /**
  * The sender a messages-scoped principal may act as RIGHT NOW, or null when it
  * may act as nobody (no bound sender, or the bound id has since become
- * reserved). The one place every messages-key use asks: the gate (POST, the
+ * reserved; the voice relay binding is not reserved for this purpose, see
+ * isVoiceRelayBinding). The one place every messages-key use asks: the gate (POST, the
  * agent= list, the row routes, whoami), the row-ownership check and the POST
  * from check -- so a later-reserved id is cut off everywhere at once.
  */
 export function messagesKeySender(auth: MessagesGateAuth | undefined): string | null {
   if (auth?.kind !== 'device' || auth.scope !== 'messages' || !auth.senderId) return null
-  return isReservedSenderId(auth.senderId) ? null : auth.senderId
+  return isReservedSenderId(auth.senderId) && !isVoiceRelayBinding(auth.senderId) ? null : auth.senderId
 }
 
 /** Row ownership for GET/PUT /api/messages/<id>: the bound sender must be on one end. */
@@ -99,6 +100,36 @@ export function isReservedSenderId(id: string): boolean {
   return reserved.includes(lc) || isKnownAgent(id) || isKnownAgent(lc)
 }
 
+/**
+ * VOICEPROV1022: the ONE reserved id a messages key may still be bound to --
+ * the voice channel (VOICE_CHANNEL_AGENT_ID). Its legitimate writer is an
+ * out-of-process relay (hang-front), and a messages key is exactly the
+ * credential that relay should hold: it can post as that one sender and read
+ * that one mailbox, nothing else. Before this, the relay needed a FULL device
+ * key, and POST /api/messages accepted from=<voice id> from ANY full key -- so
+ * the row proved "some enrolled device", not "the voice relay". The
+ * provenance gate (scripts/hooks/provenance-gate.py) now reads the voice row
+ * back as proof of origin, which is only sound when the row can come from the
+ * relay's own key alone (routes/messages.ts enforces the other half).
+ *
+ * The id stays RESERVED everywhere else (isReservedSenderId is unchanged): this
+ * is a narrow carve-out for a messages-key binding only, and it is:
+ *   - EXACT, no case folding: 'Hanna' sanitizes to an id the router does not
+ *     resolve to the voice channel, and buys nothing legitimate;
+ *   - void when a real fleet agent exists under that name (isKnownAgent): the
+ *     key would then impersonate that agent;
+ *   - void when the voice id coincides with another reserved identity (the
+ *     main agent, the owner, a system sender): those keep their protection.
+ */
+export function isVoiceRelayBinding(id: string): boolean {
+  if (id !== VOICE_CHANNEL_AGENT_ID) return false
+  if (isKnownAgent(id)) return false
+  const others = [SYSTEM_DIRECTIVE_SENDER, COORDINATOR_AGENT_ID, ...CHAT_SYSTEM_AGENTS, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, OWNER_NAME]
+    .map(r => sanitizeAgentIdent(r).toLowerCase())
+    .filter(Boolean)
+  return !others.includes(id.toLowerCase())
+}
+
 export const SENDER_ID_MAX = 64
 
 /**
@@ -112,13 +143,14 @@ export const SENDER_ID_MAX = 64
  *
  * Reserved ids (isReservedSenderId) are refused here AND on every later use
  * (messagesKeySender): a key bound to one would turn a laptop credential into
- * that identity.
+ * that identity. The one exception is the voice relay's binding
+ * (isVoiceRelayBinding, VOICEPROV1022), checked the same way in both places.
  */
 export function validateMessagesSenderId(raw: unknown): string | null {
   if (typeof raw !== 'string' || !raw.trim()) return 'sender_id is required for a messages key'
   const id = raw.trim()
   if (id.length > SENDER_ID_MAX) return `sender_id is at most ${SENDER_ID_MAX} characters`
   if (sanitizeAgentIdent(id) !== id) return 'sender_id may contain only letters, digits, _ and -'
-  if (isReservedSenderId(id)) return `sender_id '${id}' is reserved (a fleet agent or a system identity)`
+  if (isReservedSenderId(id) && !isVoiceRelayBinding(id)) return `sender_id '${id}' is reserved (a fleet agent or a system identity)`
   return null
 }
