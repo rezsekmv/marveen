@@ -100,7 +100,7 @@ interface CachedKey {
 // stored value (a typo, a hand edit, or a scope a NEWER build minted) is null,
 // and resolveDeviceKey then refuses the key outright: no access at all, never
 // the "narrowest" known scope. Mapping unknown -> operator was the old rule,
-// and it is a rollback hazard (Q re-review of cc-link): every build before
+// and it is a rollback hazard (security re-review of cc-link): every build before
 // 2a59547a reads a 'messages' key as 'operator'.
 //
 // ROLLBACK NOTE: before rolling the dashboard back to a build older than

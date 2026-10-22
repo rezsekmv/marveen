@@ -92,7 +92,7 @@ describe('tool-name prefix (CC_LINK_AGENT_NAME)', () => {
   })
 })
 
-describe('upgrade hints and inbox listing (Q review of #1)', () => {
+describe('upgrade hints and inbox listing (security review of #1)', () => {
   let h: Harness
   beforeEach(() => (h = makeHarness()))
   afterEach(() => h.cleanup())
