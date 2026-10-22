@@ -27,7 +27,8 @@ import { initDatabase, getDb, createAgentMessage, markMessageDone, markMessageFa
 import { MAIN_AGENT_ID } from '../config.js'
 import { createDeviceKey, resolveDeviceKey, listDeviceKeys, _clearDeviceKeyCacheForTest } from '../web/auth-device-keys.js'
 import { resolveAuth, requiresAuth } from '../web/auth-gate.js'
-import { messagesGateDecision, messagesKeyOwnsRow, messagesKeySender, isReservedSenderId, WHOAMI_PATH } from '../web/messages-gate.js'
+import { messagesGateDecision, messagesKeyOwnsRow, messagesKeySender, isReservedSenderId, validateMessagesSenderId, WHOAMI_PATH } from '../web/messages-gate.js'
+import { VOICE_CHANNEL_AGENT_ID } from '../channel-coordinator/ingest.js'
 import { operatorGateDecision } from '../web/operator-gate.js'
 import { defaultOperatorAccess } from '../web/operator-access.js'
 import { tryHandleAuth } from '../web/routes/auth.js'
@@ -257,8 +258,10 @@ describe('POST /api/auth/device-keys with scope messages', () => {
     }
   })
 
-  it('reserved sender ids are 400: directive sender, coordinator, voice, main agent, heartbeat, owner, any fleet agent (any case)', async () => {
-    for (const sender_id of ['system', 'System', 'telegram-coordinator', 'hanna', MAIN_AGENT_ID, MAIN_AGENT_ID.toUpperCase(), 'heartbeat', 'mate', 'neo', 'NEO']) {
+  // VOICEPROV1022: the exact voice id is the one reserved id a messages key may be bound to (the
+  // hang-front relay's key); any other spelling of it ('Hanna') stays reserved.
+  it('reserved sender ids are 400: directive sender, coordinator, voice near-miss, main agent, heartbeat, owner, any fleet agent (any case)', async () => {
+    for (const sender_id of ['system', 'System', 'telegram-coordinator', 'Hanna', 'HANNA', MAIN_AGENT_ID, MAIN_AGENT_ID.toUpperCase(), 'heartbeat', 'mate', 'neo', 'NEO']) {
       const out = await mint({ name: 'l', scope: 'messages', sender_id })
       expect(out.status, sender_id).toBe(400)
       expect(String(out.body.error)).toContain('reserved')
@@ -573,5 +576,199 @@ describe('a late real done on a row the ROUTER failed (Q final review M1)', () =
       .run(ROUTER_ABANDON_REASON, Math.floor(Date.now() / 1000), old.id)
     expect((await run(tryHandleMessages, 'PUT', `/api/messages/${old.id}`, { status: 'done', notify: false }, msgKey as RouteContext['auth'])).status).toBe(409)
     expect(rowOf(old.id).status).toBe('failed')
+  })
+})
+
+// VOICEPROV1022: the voice relay (hang-front) writes as VOICE_CHANNEL_AGENT_ID, and
+// the provenance gate now reads that row back as proof that the relay sent the
+// prompt. So the row must be writable ONLY by the relay's own key: a messages
+// key bound to exactly the voice id. That id is the one reserved id a messages
+// key may be bound to; a full key, the token, a session, or a messages key bound
+// to another sender may no longer write it.
+describe('the voice relay messages key (VOICEPROV1022)', () => {
+  const HANNA = VOICE_CHANNEL_AGENT_ID
+  const hannaKey = { kind: 'device', scope: 'messages', senderId: HANNA, device: 'hang-front', deviceId: 9 } as const
+  const auth = hannaKey as RouteContext['auth']
+  // The voice relay binding is NEVER minted over HTTP, by any principal: every HTTP lane traces back to the shared
+  // token (it can create a dashboard user and log in as it -- security review of PR #4). It is minted on the host with
+  // `npm run voice-relay-key -- mint` (scripts/voice-relay-key.ts); see voice-relay-key-cli.test.ts.
+  const session = { kind: 'session', user: 'mate' } as RouteContext['auth']
+  const mint = (body: Record<string, unknown>, who: RouteContext['auth'] = session) => run(tryHandleAuth, 'POST', '/api/auth/device-keys', body, who)
+  const hannaKeyRows = () => listDeviceKeys().filter(k => k.senderId === HANNA).length
+
+  it('the voice id is the shipped constant', () => {
+    expect(HANNA).toBe('hanna')
+  })
+
+  it('validateMessagesSenderId accepts the exact voice id, and refuses its case variants and every other reserved id', () => {
+    expect(validateMessagesSenderId(HANNA)).toBeNull()
+    for (const id of ['Hanna', 'HANNA', 'system', 'telegram-coordinator', 'channel-coordinator', 'heartbeat', 'mate', MAIN_AGENT_ID, 'neo']) {
+      expect(validateMessagesSenderId(id), id).not.toBeNull()
+    }
+    // The carve-out is for binding a key only: the id itself stays reserved.
+    expect(isReservedSenderId(HANNA)).toBe(true)
+  })
+
+  it('messagesKeySender returns the voice id for its key (and null for a near-miss binding or another scope)', () => {
+    expect(messagesKeySender(hannaKey)).toBe(HANNA)
+    expect(messagesKeySender({ ...hannaKey, senderId: 'Hanna' })).toBeNull()
+    expect(messagesKeySender({ ...hannaKey, scope: 'full' })).toBeNull()
+  })
+
+  it('HTTP mint of sender_id hanna is 403 for EVERY principal (token, session) and writes no key row; the error points to the CLI', async () => {
+    const before = hannaKeyRows()
+    for (const who of [owner, session]) {
+      const out = await mint({ name: 'hang-front', scope: 'messages', sender_id: HANNA }, who)
+      expect(out.status, JSON.stringify(who)).toBe(403)
+      expect(String(out.body.error)).toContain('npm run voice-relay-key -- mint')
+      expect(out.body.key).toBeUndefined()
+    }
+    expect(hannaKeyRows()).toBe(before)
+  })
+
+  it('Hanna, system and the main agent stay 400 (reserved); an ordinary messages key still mints 201 with the token and a session', async () => {
+    for (const sender_id of ['Hanna', 'system', MAIN_AGENT_ID]) {
+      expect((await mint({ name: 'l', scope: 'messages', sender_id })).status, sender_id).toBe(400)
+    }
+    expect((await mint({ name: 'laptop', scope: 'messages', sender_id: SENDER }, owner)).status).toBe(201)
+    expect((await mint({ name: 'laptop2', scope: 'messages', sender_id: SENDER }, session)).status).toBe(201)
+  })
+
+  it("the security review repro, end to end: token -> POST /api/auth/users -> login -> that session's hanna mint is 403, no row", async () => {
+    const before = hannaKeyRows()
+    const username = `q-repro-${Date.now()}`
+    const password = 'Correct-Horse-Battery-9!x'
+    const created = await run(tryHandleAuth, 'POST', '/api/auth/users', { username, password }, owner)
+    expect(created.status).toBe(201)
+    // Log in like a browser would, capturing the session cookie.
+    const { ctx } = fakeCtx('POST', '/api/auth/login', { username, password }, undefined)
+    let setCookie = ''
+    let loginStatus = 0
+    ;(ctx.res as any).writeHead = (s: number, h?: Record<string, string>) => { loginStatus = s; setCookie = h?.['Set-Cookie'] ?? ''; return ctx.res }
+    ;(ctx.res as any).end = () => ctx.res
+    expect(await tryHandleAuth(ctx)).toBe(true)
+    expect(loginStatus).toBe(200)
+    const cookie = setCookie.split(';')[0]!
+    expect(cookie).toMatch(/^mv_session=/)
+    const resolved = resolveAuth({ headers: { cookie } } as any, u('/api/auth/device-keys'), '/api/auth/device-keys', 'POST', TOKEN)
+    expect(resolved).toMatchObject({ kind: 'session', user: username })
+    const out = await mint({ name: 'hang-front', scope: 'messages', sender_id: HANNA }, resolved as RouteContext['auth'])
+    expect(out.status).toBe(403)
+    expect(hannaKeyRows()).toBe(before)
+  })
+
+  it('end to end NEGATIVE: the shared token cannot obtain any credential that posts from=hanna', async () => {
+    const count = () => (getDb().prepare('SELECT COUNT(*) AS c FROM agent_messages WHERE from_agent = ?').get(HANNA) as { c: number }).c
+    const before = count()
+    // Every key the token can mint: full, operator, and a messages key bound to anything it is allowed to bind.
+    const minted: Array<Record<string, unknown>> = []
+    for (const body of [
+      { name: 't-full' },
+      { name: 't-full2', scope: 'full' },
+      { name: 't-op', scope: 'operator' },
+      { name: 't-msg', scope: 'messages', sender_id: SENDER },
+      { name: 't-hanna', scope: 'messages', sender_id: HANNA },
+      { name: 't-Hanna', scope: 'messages', sender_id: 'Hanna' },
+    ]) {
+      const out = await mint(body, owner)
+      if (out.status === 201) minted.push(out.body)
+      else expect(body.sender_id, JSON.stringify(body)).toBeDefined() // only the voice bindings are refused
+    }
+    expect(minted.map(m => m.sender_id)).not.toContain(HANNA)
+    for (const m of minted) {
+      _clearDeviceKeyCacheForTest()
+      const req: any = { headers: { authorization: `Bearer ${m.key}` } }
+      const resolved = resolveAuth(req, u('/api/messages'), '/api/messages', 'POST', TOKEN)
+      expect(resolved, String(m.name)).toBeTruthy()
+      const blocked = resolved && (resolved as { kind: string }).kind === 'device'
+        ? gate(resolved as Parameters<typeof messagesGateDecision>[0], 'POST', '/api/messages')
+        : null
+      if (blocked) continue
+      const out = await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: 'forged voice' }, resolved as RouteContext['auth'])
+      expect(out.status, String(m.name)).toBe(403)
+    }
+    // And the token itself.
+    expect((await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: 'forged voice' }, owner)).status).toBe(403)
+    expect(count()).toBe(before)
+  })
+
+  it('a real fleet agent named hanna voids the carve-out: mint, validation, the gate and the routes all refuse', async () => {
+    const row = createAgentMessage(MAIN_AGENT_ID, HANNA, 'answer before onboarding')
+    ROSTER.add(HANNA)
+    try {
+      expect(validateMessagesSenderId(HANNA)).not.toBeNull()
+      expect(messagesKeySender(hannaKey)).toBeNull()
+      expect((await mint({ name: 'hf', scope: 'messages', sender_id: HANNA })).status).toBe(400)
+      expect(gate(hannaKey, 'POST', '/api/messages')).toBe('messages credential: its bound sender is now a reserved id')
+      expect(gate(hannaKey, 'GET', `/api/messages?agent=${HANNA}`)).not.toBeNull()
+      expect((await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: 'x' }, auth)).status).toBe(403)
+      expect((await run(tryHandleMessages, 'GET', `/api/messages/${row.id}`, undefined, auth)).status).toBe(403)
+    } finally {
+      ROSTER.delete(HANNA)
+    }
+  })
+
+  it('the gate lets the voice key reach POST, its own mailbox, its rows and whoami, and nothing else', () => {
+    expect(gate(hannaKey, 'POST', '/api/messages')).toBeNull()
+    expect(gate(hannaKey, 'GET', `/api/messages?agent=${HANNA}`)).toBeNull()
+    expect(gate(hannaKey, 'GET', '/api/messages/42')).toBeNull()
+    expect(gate(hannaKey, 'PUT', '/api/messages/42')).toBeNull()
+    expect(gate(hannaKey, 'GET', WHOAMI_PATH)).toBeNull()
+    expect(gate(hannaKey, 'GET', '/api/messages?agent=jarvis')).toBe('messages credential: only its own mailbox (agent=<bound sender>)')
+    expect(gate(hannaKey, 'GET', `/api/messages?agent=${MAIN_AGENT_ID}`)).not.toBeNull()
+    expect(gate(hannaKey, 'GET', '/api/memories')).toBe('messages credential: not a message endpoint')
+  })
+
+  it('POST from=hanna with the voice key lands (200) as a hanna row', async () => {
+    const out = await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: '[HANG-FRONT delegation t1] mi a helyzet?' }, auth)
+    expect(out.status).toBe(200)
+    expect(out.body).toMatchObject({ from_agent: HANNA, to_agent: MAIN_AGENT_ID })
+  })
+
+  it('NEGATIVE CONTROLS: from=hanna on a full key, an operator key, the token, a session, or another messages key is 403, and writes nothing', async () => {
+    const count = () => (getDb().prepare('SELECT COUNT(*) AS c FROM agent_messages WHERE from_agent = ?').get(HANNA) as { c: number }).c
+    const before = count()
+    for (const other of [
+      { kind: 'device', scope: 'full', device: 'phone', deviceId: 3 },
+      { kind: 'device', scope: 'operator', device: 'op', deviceId: 4 },
+      { kind: 'token' },
+      { kind: 'session', user: 'mate' },
+      msgKey,
+    ]) {
+      const out = await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: 'forged voice' }, other as RouteContext['auth'])
+      expect(out.status, JSON.stringify(other)).toBe(403)
+    }
+    expect(count()).toBe(before)
+  })
+
+  it('the voice key cannot post as anyone else (the bound-sender rule still holds)', async () => {
+    for (const from of [MAIN_AGENT_ID, 'neo', SENDER, 'Hanna', '@hanna']) {
+      expect((await run(tryHandleMessages, 'POST', '/api/messages', { from, to: MAIN_AGENT_ID, content: 'x' }, auth)).status, from).toBe(403)
+    }
+  })
+
+  it('GET ?agent=hanna (hang-front readMailbox) returns its rows; GET/PUT of its own row works, a foreign row is 403', async () => {
+    const answer = createAgentMessage(MAIN_AGENT_ID, HANNA, '[HANG-FRONT delegation t2] kesz')
+    const foreign = createAgentMessage('neo', MAIN_AGENT_ID, 'not for the voice relay')
+    const list = await run(tryHandleMessages, 'GET', `/api/messages?agent=${HANNA}`, undefined, auth)
+    expect(list.status).toBe(200)
+    expect(list.body.map((r: { id: number }) => r.id)).toContain(answer.id)
+    for (const row of list.body) expect([row.from_agent, row.to_agent]).toContain(HANNA)
+
+    expect((await run(tryHandleMessages, 'GET', `/api/messages/${answer.id}`, undefined, auth)).status).toBe(200)
+    expect((await run(tryHandleMessages, 'GET', `/api/messages/${foreign.id}`, undefined, auth)).status).toBe(403)
+    expect((await run(tryHandleMessages, 'PUT', `/api/messages/${foreign.id}`, { status: 'done', notify: false }, auth)).status).toBe(403)
+    expect((await run(tryHandleMessages, 'PUT', `/api/messages/${answer.id}`, { status: 'done', notify: false }, auth)).status).toBe(200)
+  })
+
+  it('end to end: a minted hanna key resolves through resolveAuth, passes the gate, and its POST lands', async () => {
+    const k = createDeviceKey('hang-front-e2e', { scope: 'messages', senderId: HANNA, expiresInDays: 30 })
+    _clearDeviceKeyCacheForTest()
+    const req: any = { headers: { authorization: `Bearer ${k.key}` } }
+    const resolved = resolveAuth(req, u('/api/messages'), '/api/messages', 'POST', TOKEN)
+    expect(resolved).toMatchObject({ kind: 'device', scope: 'messages', senderId: HANNA })
+    expect(gate(resolved as Parameters<typeof messagesGateDecision>[0], 'POST', '/api/messages')).toBeNull()
+    const out = await run(tryHandleMessages, 'POST', '/api/messages', { from: HANNA, to: MAIN_AGENT_ID, content: 'e2e' }, resolved as RouteContext['auth'])
+    expect(out.status).toBe(200)
   })
 })

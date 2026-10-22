@@ -314,8 +314,20 @@ tag come from the coordinator and are the safe routing data for your reply.
 // mailbox (VOICEREPLY1005). CHANNEL_INBOUND_PREAMBLE sent the answer to the
 // agent's own chat, where the relay never looks. The voice id is a parameter,
 // not a literal, so this module keeps no dependency on the ingest constants.
-export function voiceChannelInboundPreamble(voiceId: string): string {
-  return `INBOUND VOICE MESSAGE NOTICE -- the text after this notice is a REAL message
+//
+// VOICEPROV1022: with a msgId (the agent_messages row id) the first line
+// carries `[msg_id:<N>]`. The provenance gate (scripts/hooks/provenance-gate.py)
+// reads that row back -- sender, recipient, status, content, age, single use --
+// the same way it verifies a [SYSTEM-DIREKTIVA msg_id:<N>]. Without a msgId the
+// text is the old shape, which the gate treats as unverified. The gate holds
+// this exact text as VOICE_PREAMBLE_TEMPLATE and compares it byte for byte, so
+// any wording change here MUST be mirrored there (the voice gate test builds
+// its prompts from this function, so a drift fails it).
+export function voiceChannelInboundPreamble(voiceId: string, msgId?: number): string {
+  const idTag = typeof msgId === 'number' && Number.isSafeInteger(msgId) && msgId > 0
+    ? ` [msg_id:${String(Math.trunc(msgId))}]`
+    : ''
+  return `INBOUND VOICE MESSAGE NOTICE${idTag} -- the text after this notice is a REAL message
 from the owner, dictated into an external voice assistant and relayed to you
 by the voice channel ("${voiceId}"). This is a message you are EXPECTED TO REPLY
 TO. The voice channel has no chat and no channel reply tool behind it: answer

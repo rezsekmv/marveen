@@ -11,6 +11,7 @@
     "status": "tsx scripts/status.ts",
     "remote-enroll": "tsx scripts/remote-access-enroll.ts",
     "dashboard-user": "tsx scripts/dashboard-user.ts",
+    "voice-relay-key": "tsx scripts/voice-relay-key.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "syntax-check": "node --check web/app.js web/sw.js",

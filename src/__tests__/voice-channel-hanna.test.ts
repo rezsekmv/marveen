@@ -44,7 +44,7 @@ describe('voice channel identity', () => {
 })
 
 describe('/api/messages write guard for the voice channel', () => {
-  async function postAs(from: string, auth?: { kind: string; device?: string; deviceId?: number }) {
+  async function postAs(from: string, auth?: { kind: string; device?: string; deviceId?: number; scope?: string; senderId?: string }) {
     const payload = JSON.stringify({ from, to: 'marveen', content: 'a dictated line' })
     const req = Readable.from([Buffer.from(payload)]) as any
     let status = 0
@@ -84,30 +84,59 @@ describe('/api/messages write guard for the voice channel', () => {
     }
   })
 
-  it('PASSES both guards on the device lane (it has no agents/<id>/ dir either)', async () => {
-    // Two guards could refuse this: the device-key lane check, and the
-    // known-agent check (the voice id has no agents/<id>/ directory, so it
-    // needs an explicit exemption). Passing BOTH means the handler runs on to
-    // the insert -- which throws here because this harness has no DB. That
-    // throw is the PROOF of passage, so we assert on it rather than skipping:
-    // a guard rejection would have returned a 403 instead of ever reaching db.
-    await expect(
-      postAs(VOICE_CHANNEL_AGENT_ID, { kind: 'device', device: 'a-device', deviceId: 5 }),
-    ).rejects.toThrow(/prepare/)
+  // VOICEPROV1022: the lane used to be "any enrolled device key". The provenance
+  // gate now reads the voice row back as proof that the hang-front relay sent the
+  // prompt, so only the relay's OWN key may write it: a messages-scoped device key
+  // bound to the voice id.
+  const HANNA_KEY = { kind: 'device', scope: 'messages', senderId: VOICE_CHANNEL_AGENT_ID, device: 'hang-front', deviceId: 5 }
+
+  it('PASSES both guards with the voice relay messages key (it has no agents/<id>/ dir either)', async () => {
+    // Two guards could refuse this: the credential check, and the known-agent
+    // check (the voice id has no agents/<id>/ directory, so it needs an explicit
+    // exemption). Passing BOTH means the handler runs on to the insert -- which
+    // throws here because this harness has no DB. That throw is the PROOF of
+    // passage, so we assert on it rather than skipping: a guard rejection would
+    // have returned a 403 instead of ever reaching db.
+    await expect(postAs(VOICE_CHANNEL_AGENT_ID, HANNA_KEY)).rejects.toThrow(/prepare/)
+  })
+
+  it('REJECTS a FULL-scope device key (VOICEPROV1022: an enrolled full key used to pass)', async () => {
+    const { status } = await postAs(VOICE_CHANNEL_AGENT_ID, { kind: 'device', scope: 'full', device: 'a-device', deviceId: 5 })
+    expect(status).toBe(403)
+  })
+
+  it('REJECTS an operator-scope device key and a scope-less device principal', async () => {
+    expect((await postAs(VOICE_CHANNEL_AGENT_ID, { kind: 'device', scope: 'operator', device: 'a-device', deviceId: 5 })).status).toBe(403)
+    expect((await postAs(VOICE_CHANNEL_AGENT_ID, { kind: 'device', device: 'a-device', deviceId: 5 })).status).toBe(403)
+  })
+
+  it('REJECTS a messages key bound to ANOTHER sender', async () => {
+    const { status } = await postAs(VOICE_CHANNEL_AGENT_ID, { kind: 'device', scope: 'messages', senderId: 'laptop-cc', device: 'laptop', deviceId: 6 })
+    expect(status).toBe(403)
+  })
+
+  it('REJECTS the sanitize-bypass spellings even on the voice relay key (from must equal the bound sender)', async () => {
+    for (const forged of ['@hanna', 'hanna.', 'hanna!', 'Hanna']) {
+      const { status } = await postAs(forged, HANNA_KEY)
+      expect(status, `forged from=${JSON.stringify(forged)} must be blocked`).toBe(403)
+    }
   })
 
   it('NEGATIVE CONTROL: an unknown non-voice id is refused by the known-agent guard', async () => {
     // Without this the test above proves nothing: it would pass even if the
     // handler let EVERY sender through to the insert.
-    const { status, body } = await postAs('zack-the-stranger', { kind: 'device', device: 'a-device', deviceId: 5 })
+    const { status, body } = await postAs('zack-the-stranger', { kind: 'device', scope: 'full', device: 'a-device', deviceId: 5 })
     expect(status).toBe(403)
     expect(String(body?.error)).toMatch(/unknown agent/i)
   })
 })
 
 describe('the two halves stay paired in the source', () => {
-  it('the route guards the voice id on the AUTH LANE, not with a blanket 403', () => {
-    expect(MESSAGES_ROUTE_SRC).toMatch(/sanitizeAgentIdent\(from\)\s*===\s*VOICE_CHANNEL_AGENT_ID\s*&&\s*ctx\.auth\?\.kind\s*!==\s*'device'/)
+  it('the route guards the voice id on the CREDENTIAL (the relay messages key), not with a blanket 403', () => {
+    expect(MESSAGES_ROUTE_SRC).toMatch(/sanitizeAgentIdent\(from\)\s*===\s*VOICE_CHANNEL_AGENT_ID\s*&&/)
+    expect(MESSAGES_ROUTE_SRC).toMatch(/messagesKeySender\(ctx\.auth\)\s*===\s*VOICE_CHANNEL_AGENT_ID/)
+    // VOICEPROV1022: the old "any device key" lane must be gone.
+    expect(MESSAGES_ROUTE_SRC).not.toMatch(/VOICE_CHANNEL_AGENT_ID\s*&&\s*ctx\.auth\?\.kind\s*!==\s*'device'/)
   })
 
   it('the id comes from the shared constant, never a literal in the route', () => {

@@ -275,21 +275,33 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // Voice channel (HANGCSATORNA918): the VOICE_CHANNEL_AGENT_ID also earns
     // channel-inbound
     // framing, but unlike the coordinator it is a legitimate POST writer -- the
-    // relay runs out-of-process. So the guard is the AUTH LANE, not a blanket
-    // 403: accept it only from an enrolled DEVICE KEY.
+    // relay runs out-of-process. So the guard is the CREDENTIAL, not a blanket
+    // 403.
     //
-    // WHY THE LANE AND NOT THE NAME: channel-inbound tells the receiving agent
-    // "this is the owner, a reply is expected". The dashboard token is readable
-    // by every sub-agent, so a name-only rule would let any of them forge an
-    // owner message. A device key is a per-device secret the sub-agents do not
-    // have, so requiring it is what makes the id trustworthy at DELIVERY time,
-    // where the auth context is long gone and only from_agent survives.
-    if (sanitizeAgentIdent(from) === VOICE_CHANNEL_AGENT_ID && ctx.auth?.kind !== 'device') {
+    // WHY THE CREDENTIAL AND NOT THE NAME: channel-inbound tells the receiving
+    // agent "this is the owner, a reply is expected". The dashboard token is
+    // readable by every sub-agent, so a name-only rule would let any of them
+    // forge an owner message.
+    //
+    // VOICEPROV1022: the rule used to be "any enrolled device key", so every
+    // FULL key (or operator key) passed as the voice channel too, and the row
+    // proved only "some enrolled device wrote this". The provenance gate
+    // (scripts/hooks/provenance-gate.py) now reads the voice row back as proof
+    // that the hang-front relay sent the prompt it is looking at, so the row
+    // must be writable by the relay's own key alone: a 'messages' scoped device
+    // key whose bound sender IS the voice id (messages-gate.ts
+    // isVoiceRelayBinding allows exactly that one binding). Any other principal
+    // -- token, session, full/operator device key, a messages key bound to
+    // another sender -- gets a 403 for this id.
+    if (
+      sanitizeAgentIdent(from) === VOICE_CHANNEL_AGENT_ID &&
+      !(ctx.auth?.kind === 'device' && ctx.auth.scope === 'messages' && messagesKeySender(ctx.auth) === VOICE_CHANNEL_AGENT_ID)
+    ) {
       logger.warn(
-        { from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none' },
-        'Rejected /api/messages POST as voice channel without a device key',
+        { from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none', scope: ctx.auth?.kind === 'device' ? ctx.auth.scope : undefined },
+        'Rejected /api/messages POST as voice channel without the voice relay messages key',
       )
-      json(res, { error: `from '${VOICE_CHANNEL_AGENT_ID}' requires an enrolled device key, not the shared dashboard token` }, 403)
+      json(res, { error: `from '${VOICE_CHANNEL_AGENT_ID}' requires the voice relay's messages-scoped device key (bound to '${VOICE_CHANNEL_AGENT_ID}'), not the shared dashboard token or another device key` }, 403)
       return true
     }
     // Federation spoof guard: a slash-qualified from ("teodor/teodor") is the
@@ -328,7 +340,8 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     const isOwnerSender = sanitizeAgentIdent(from) === sanitizeAgentIdent(OWNER_NAME)
     // The voice channel is the OWNER speaking, not a fleet agent: it has no
     // agents/<id>/ directory, so isKnownAgent alone would 403 it. It is already
-    // device-key gated above, which is a STRONGER check than this one.
+    // gated above to the voice relay's own messages key, a STRONGER check than
+    // this one.
     const isVoiceChannelSender = sanitizeAgentIdent(from) === VOICE_CHANNEL_AGENT_ID
     const isSystemSender = SYSTEM_SENDERS.has(sanitizeAgentIdent(from))
     if (!isOwnerSender && !isSystemSender && !isVoiceChannelSender && !isKnownAgent(sanitizeAgentIdent(from))) {
