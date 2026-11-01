@@ -94,6 +94,7 @@ export function messagesKeyOwnsRow(auth: MessagesGateAuth | undefined, row: { fr
 export function isReservedSenderId(id: string): boolean {
   const lc = id.toLowerCase()
   const reserved = [SYSTEM_DIRECTIVE_SENDER, COORDINATOR_AGENT_ID, VOICE_CHANNEL_AGENT_ID, ...CHAT_SYSTEM_AGENTS, MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, OWNER_NAME]
+    .filter((r): r is string => typeof r === 'string' && r !== '')
     .map(r => sanitizeAgentIdent(r).toLowerCase())
     .filter(Boolean)
   return reserved.includes(lc) || isKnownAgent(id) || isKnownAgent(lc)
