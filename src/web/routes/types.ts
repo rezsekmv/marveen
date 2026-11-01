@@ -23,8 +23,10 @@ export interface RouteContext {
    *  SELF-ASSERTED fleet-agent id (X-Agent-Id, 'token' kind only): validated
    *  against the roster but NOT authenticated -- one shared token means it can
    *  be typed by anyone, so it may warn and attribute, never authorize.
+   *  `senderId` is the sender a 'messages' scoped device key is bound to (set
+   *  for that scope only, by the key itself, so it IS authenticated).
    *  Lets routes distinguish a human session from a token/fleet caller. */
-  auth?: { kind: 'token' | 'session' | 'federation' | 'device'; user?: string; peer?: string; device?: string; deviceId?: number; agent?: string; scope?: 'full' | 'operator' }
+  auth?: { kind: 'token' | 'session' | 'federation' | 'device'; user?: string; peer?: string; device?: string; deviceId?: number; agent?: string; scope?: 'full' | 'operator' | 'messages'; senderId?: string }
 }
 
 export type RouteHandler = (ctx: RouteContext) => Promise<boolean>

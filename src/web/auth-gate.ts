@@ -24,14 +24,14 @@ import type http from 'node:http'
 import { checkBearerToken } from './dashboard-auth.js'
 import { identifyFederationCaller } from './federation/config.js'
 import { resolveSession } from './auth-sessions.js'
-import { resolveDeviceKey, type DeviceKeyScope } from './auth-device-keys.js'
+import { resolveDeviceKey, type DeviceKeyScope, type DeviceKeyPrincipal } from './auth-device-keys.js'
 import { OPERATOR_COOKIE_NAME, resolveOperatorSession } from './operator-sessions.js'
 import { sanitizeAgentIdent } from '../prompt-safety.js'
 import { isKnownAgent } from './agent-config.js'
 
 export type AuthResult =
   | { kind: 'token'; agent?: string }
-  | { kind: 'device'; device: string; deviceId: number; scope: DeviceKeyScope }
+  | { kind: 'device'; device: string; deviceId: number; scope: DeviceKeyScope; senderId?: string }
   | { kind: 'federation'; peer: string }
   | { kind: 'session'; user: string }
   | { kind: 'none' }
@@ -121,6 +121,12 @@ export function requiresAuth(path: string, method: string): boolean {
   return path.startsWith('/api/')
 }
 
+// senderId is spread in only when present, so a full/operator principal keeps
+// exactly the shape it had before the messages scope existed.
+function deviceResult(dk: DeviceKeyPrincipal): AuthResult {
+  return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope, ...(dk.senderId ? { senderId: dk.senderId } : {}) }
+}
+
 export function resolveAuth(
   req: http.IncomingMessage,
   url: URL,
@@ -142,7 +148,7 @@ export function resolveAuth(
   const bearerMatch = /^Bearer\s+(.+)$/.exec(req.headers.authorization ?? '')
   if (bearerMatch) {
     const dk = resolveDeviceKey(bearerMatch[1]!.trim())
-    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope }
+    if (dk) return deviceResult(dk)
   }
 
   // 3. SSE pane stream ?token= (EventSource cannot set an Authorization header):
@@ -152,7 +158,7 @@ export function resolveAuth(
     const qtoken = url.searchParams.get('token') ?? ''
     if (checkBearerToken(`Bearer ${qtoken}`, dashboardToken)) return { kind: 'token' }
     const dk = resolveDeviceKey(qtoken)
-    if (dk) return { kind: 'device', device: dk.name, deviceId: dk.id, scope: dk.scope }
+    if (dk) return deviceResult(dk)
   }
 
   // 4. Scoped per-peer federation tokens: valid ONLY on the two wire endpoints,
