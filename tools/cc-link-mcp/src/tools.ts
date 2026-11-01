@@ -58,7 +58,7 @@ export function toolDefinitions(names: ToolNames, maxText: number, waitSec: numb
     {
       name: names.inbox,
       description:
-        'List what this session received from the main agent, sent messages still waiting for an answer, and messages waiting for the next new session in this folder.',
+        'List what this session received from the main agent (answers, and messages to this folder: running sessions receive those within seconds), sent messages still waiting for an answer, and unaddressed messages (peek only).',
       inputSchema: { type: 'object', properties: {} },
     },
   ]

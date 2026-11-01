@@ -112,7 +112,7 @@ All configuration comes from the environment (read in `src/config.ts`).
 | `CC_LINK_STATE_DIR` | no | state directory, default `~/.cc-link` |
 | `CC_LINK_DRY_RUN` | no | `1` = dry run (also the `--dry-run` argument) |
 | `CC_LINK_ASK_WAIT_SEC` | no | how long `agent_message` with `wait: true` waits for an answer, default 60 |
-| `CC_LINK_POLL_SEC` | no | background answer-poll interval, default 15 |
+| `CC_LINK_POLL_SEC` | no | background poll interval (answers, and the folder inbox of a running session), default 15 |
 | `CC_LINK_FLUSH_SEC` | no | outbox flush interval, default 300 |
 
 If a required variable is missing, the server still starts (Claude Code shows
@@ -124,7 +124,7 @@ it connected) and every tool returns an error naming the missing variable.
 |---|---|
 | `agent_message(text, wait?)` | Sends a message. Without `wait` (or `wait: false`) it returns at once with `sent (id N)` or `queued in outbox`; header `[Claude Code üzenet] <date time> · <repo>@<branch>`. With `wait: true` the header is `[Claude Code kérdés] ...` (someone is waiting) and it polls every 3 s for up to `CC_LINK_ASK_WAIT_SEC`, returning the answer, the failure, or the id to look up later. Both are queued in the outbox when the dashboard is unreachable, and both are tracked, so an answer that comes later is pushed either way. |
 | `agent_reply(id)` | The state of ANY message sent from this folder, by id: `waiting` (not yet delivered / delivered, no answer yet), `read by the main agent, closed without an answer`, `answered` (with the answer) or `failed`. Also accepts rows from older cc-link builds (`[Claude Code összefoglaló]` / `[Claude Code kérdés]` headers). Auth, missing-id and server errors are reported as such. |
-| `agent_inbox()` | What this session received, its sent messages still waiting for an answer, how many folder-inbox messages wait for the next new session, unaddressed messages (peek only), and the main-agent id with its source (`whoami`, `graph` or `env`). |
+| `agent_inbox()` | What this session received, its sent messages still waiting for an answer, how many folder-inbox messages are not claimed yet, unaddressed messages (peek only), and the main-agent id with its source (`whoami`, `graph` or `env`). |
 
 The note and ask tools of earlier builds are gone; calling one of them
 answers with a pointer to `agent_message`.
@@ -174,17 +174,34 @@ dashboard's 120 character cut so `folder:<folder-key>` always survives.
    keeps watching the rest. Running sessions never adopt.
 3. **Messages the main agent starts belong to a folder.** A message to this
    machine whose `origin_note` contains the explicit marker
-   `folder:<folder-key>` is waiting for the next new session in that folder.
-   Running sessions only count these (`agent_inbox`); they never claim them.
-   A message with no `folder:` marker is **unaddressed** and is never delivered
+   `folder:<folder-key>` goes to **every session running in that folder**,
+   within about `CC_LINK_POLL_SEC` (default 15 s). If none is running, it
+   waits for the next new session in that folder. A session started after the
+   message was claimed does not get it. A message with no `folder:` marker is **unaddressed** and is never delivered
    to any folder: it stays on the dashboard, and `agent_inbox` lists it as
    "unaddressed" (peek only).
-4. **Claiming** happens at session start, under one machine-wide lock
-   (`<state-dir>/inbox.lock`) so a message is claimed exactly once even when
-   sessions start in several folders at the same moment: each message is
-   closed on the dashboard (`status: done`, no reverse notification) and then
-   pushed, oldest first. If closing fails, the message is left for a later
-   session.
+4. **Claiming** happens at session start (pending rows plus the newest 200
+   conversation rows, waiting up to 30 s for the lock) and on every watcher
+   tick of a running session (pending rows only, plus the conversation scan
+   every 20th tick, about 5 minutes, so a row the router abandoned while no
+   session looked is still claimed; a busy lock skips the round).
+   It runs under one machine-wide lock (`<state-dir>/inbox.lock`), so a
+   message is claimed exactly once even when sessions in several folders look
+   at the same moment: the first session to see it closes it on the dashboard
+   (`status: done`, no reverse notification), shows and pushes it, oldest
+   first, and hands it to the other sessions running in its folder at that
+   moment through `<state-dir>/folders/<folder-key>/broadcast.json`. They take
+   it on their next tick or tool call (local file, no network) and drop
+   themselves from its recipients; an entry is removed once no current
+   recipient is left, or after 7 days. Running sessions are registered in
+   `<state-dir>/folders/<folder-key>/sessions/<pid>.json` with their start
+   time (removed on a clean exit; a dead pid or a file from before the last
+   boot does not count). A recipient is the pid AND that start time, so a pid
+   reused after an unclean exit is a different session and gets nothing meant
+   for the old one. If
+   closing fails, the message is left for a later look. A message that
+   addresses several folders is claimed once, by the first folder that sees
+   it.
 
 A row the dashboard's router closed as failed is still delivered when the
 router says so: `failed_by` is `router` and the result is one of the router's
@@ -448,6 +465,11 @@ lockfile's version, frozen lockfile).
   `CC_LINK_POLL_SEC`; messages sent without `wait` are tracked too, so a
   session that sends many of them makes that many GETs per tick until the
   main agent closes them (or 7 days pass).
+- Every running session lists its pending inbox rows once per
+  `CC_LINK_POLL_SEC` (one GET). A session that exits or crashes after a
+  message was handed to it but before its next tick or tool call misses that
+  message (the row is already closed); without channels (pull mode), a
+  handed-out message shows up in the status line of the next tool result.
 - The outbox is flushed before every tool call. When the mini is offline and
   items are waiting, each tool call can take up to 10 s longer (the request
   timeout).

@@ -2,10 +2,10 @@
  * Pure delivery rules (no I/O). See README "Delivery rules":
  *  (1) an answer goes only to the asking session        -> ownAsks
  *  (2) a new session adopts asks of dead sessions        -> orphanAsks
- *  (3) main-agent-initiated messages are claimed only by
- *      a NEW session in the folder named by an explicit
- *      folder:<key> marker; unaddressed ones are never
- *      claimed, only listed                               -> selectInbox / selectUnaddressed
+ *  (3) main-agent-initiated messages go to the folder
+ *      named by an explicit folder:<key> marker: every
+ *      session running there, else the next new one;
+ *      unaddressed ones are never claimed, only listed    -> selectInbox / selectUnaddressed
  */
 import { createHash } from 'node:crypto'
 import type { MessageRow } from './api.ts'
