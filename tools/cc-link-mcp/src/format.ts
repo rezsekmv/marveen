@@ -1,14 +1,26 @@
 /**
  * Pure text builders: message contents sent to the main agent, and the status
- * line appended to every tool result. The two header strings and the
+ * line appended to every tool result. The header strings and the
  * "no answer yet" text are Hungarian on purpose (the main agent reads them).
  */
 import { randomBytes } from 'node:crypto'
 import { formatLocalTimestamp } from './identity.ts'
 
-export const NOTE_HEADER = '[Claude Code összefoglaló]'
+/** A message sent without waiting for the answer (any message can still be answered). */
+export const MESSAGE_HEADER = '[Claude Code üzenet]'
+/** A message whose sender waits for the answer (wait=true): the main agent should answer soon. */
 export const ASK_HEADER = '[Claude Code kérdés]'
+/** Legacy: the header of the removed note tool. Still recognised as an own message. */
+export const NOTE_HEADER = '[Claude Code összefoglaló]'
+/** Legacy: the second line of a note from the removed note tool. */
 export const NO_REPLY_NEEDED = 'Nem kell válasz.'
+/** Every header cc-link has written, current and legacy. */
+export const OWN_HEADERS = [MESSAGE_HEADER, ASK_HEADER, NOTE_HEADER] as const
+
+/** Does `content` start with one of cc-link's own header lines? */
+export function hasOwnHeader(content: string): boolean {
+  return OWN_HEADERS.some(h => content.startsWith(h + ' ') || content === h || content.startsWith(h + '\n'))
+}
 
 export interface ContentContext {
   now: Date
@@ -48,29 +60,28 @@ function headerLine(header: string, ctx: ContentContext): string {
   return `${header} ${formatLocalTimestamp(ctx.now)} · ${ctx.repo}@${ctx.branch}${ref}`
 }
 
-export function buildNoteContent(text: string, ctx: ContentContext): string {
-  return `${headerLine(NOTE_HEADER, ctx)}\n${NO_REPLY_NEEDED}\n\n${text}`
+/** Content of a message: the header line (ASK_HEADER when the sender waits), a blank line, the text. */
+export function buildMessageContent(text: string, ctx: ContentContext, wait = false): string {
+  return `${headerLine(wait ? ASK_HEADER : MESSAGE_HEADER, ctx)}\n\n${text}`
 }
 
-export function buildAskContent(question: string, ctx: ContentContext): string {
-  return `${headerLine(ASK_HEADER, ctx)}\n\n${question}`
-}
-
-/** Strip our own header lines to recover the question text (for previews of outbox asks). */
+/** Strip our own header lines to recover the message text (for previews of outbox items). */
 export function stripHeader(content: string): string {
   const lines = content.split('\n')
-  if (lines[0]?.startsWith(NOTE_HEADER) || lines[0]?.startsWith(ASK_HEADER)) lines.shift()
-  if (lines[0] === NO_REPLY_NEEDED) lines.shift()
+  if (lines[0] !== undefined && hasOwnHeader(lines[0])) {
+    lines.shift()
+    if (lines[0] === NO_REPLY_NEEDED) lines.shift()
+  }
   return lines.join('\n').trim()
 }
 
-export function noAnswerYet(id: number): string {
-  return `Nincs még válasz (id ${id}). Később érkezik channel-értesítésként, vagy kérd le: tony_reply(${id}).`
+export function noAnswerYet(id: number, replyTool: string): string {
+  return `Nincs még válasz (id ${id}). Később érkezik channel-értesítésként, vagy kérd le: ${replyTool}(${id}).`
 }
 
 export interface StatusInfo {
   outboxWaiting: number
-  /** Received items this session has not displayed through tony_inbox (or a tool result) yet. */
+  /** Received items this session has not displayed through the inbox tool (or a tool result) yet. */
   unseenReceived?: number
   /** The last flush stopped on 401/403. */
   authError?: boolean
@@ -78,12 +89,14 @@ export interface StatusInfo {
   newlyRejected: readonly string[]
   outboxDir: string
   extraWarnings?: readonly string[]
+  /** Name of the inbox tool (prefixed), for the "call ..." hint. */
+  inboxTool: string
 }
 
 export function statusLine(s: StatusInfo): string {
   const parts = [`outbox: ${s.outboxWaiting} waiting`]
   if (s.unseenReceived && s.unseenReceived > 0) {
-    parts.push(`${s.unseenReceived} received item(s) not yet shown: call tony_inbox`)
+    parts.push(`${s.unseenReceived} received item(s) not yet shown: call ${s.inboxTool}`)
   }
   if (s.authError) {
     parts.push('WARNING: auth error (HTTP 401/403) while flushing, outbox kept; check MARVEEN_DEVICE_KEY and MARVEEN_SENDER_ID')
@@ -110,12 +123,12 @@ export const META_VALUE_MAX = 64
  * Make text safe to embed in a <channel ...> event: a forged "<channel" or
  * "</channel" inside the content must not open or close a tag. The "<" of
  * those sequences becomes "‹" (single angle quotation mark). Long content is
- * cut with a marker (the full text stays available via tony_inbox).
+ * cut with a marker (the full text stays available via the inbox tool).
  */
-export function sanitizeChannelContent(content: string, max = CHANNEL_CONTENT_MAX): string {
+export function sanitizeChannelContent(content: string, max = CHANNEL_CONTENT_MAX, inboxTool = 'the inbox tool'): string {
   const neutral = content.replace(/<(\/?channel)/gi, '\u2039$1')
   if (neutral.length <= max) return neutral
-  const marker = `\n\n[truncated: ${neutral.length - max} more characters; the full text is in tony_inbox]`
+  const marker = `\n\n[truncated: ${neutral.length - max} more characters; the full text is in ${inboxTool}]`
   return neutral.slice(0, max) + marker
 }
 

@@ -100,13 +100,12 @@ describe('secret scan on the tool path', () => {
   let h: Harness
   afterEach(() => h.cleanup())
 
-  for (const tool of ['tony_note', 'tony_ask'] as const) {
-    test(`${tool} refuses: nothing sent, nothing queued, fetch never called`, async () => {
+  for (const wait of [false, true] as const) {
+    test(`agent_message (wait=${wait}) refuses: nothing sent, nothing queued, fetch never called`, async () => {
       h = makeHarness()
       const { link } = makeLink(h, { pid: 4001 })
       const secret = SAMPLES.ghp!
-      const arg = tool === 'tony_note' ? { text: `deploy note ${secret}` } : { question: `is ${secret} valid?` }
-      const r = await link.callTool(tool, arg)
+      const r = await link.callTool('agent_message', { text: `deploy note ${secret}`, wait })
       expect(r.isError).toBe(true)
       expect(r.text).toContain('github_token')
       expect(r.text).not.toContain(secret)
@@ -119,7 +118,7 @@ describe('secret scan on the tool path', () => {
     h = makeHarness()
     h.dash.override = () => 'network'
     const { link } = makeLink(h, { pid: 4002 })
-    const r = await link.callTool('tony_note', { text: SAMPLES.password_assign! })
+    const r = await link.callTool('agent_message', { text: SAMPLES.password_assign! })
     expect(r.isError).toBe(true)
     expect(link.deps.outbox.count()).toBe(0)
     expect(h.dash.posts().length).toBe(0)

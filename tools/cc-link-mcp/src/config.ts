@@ -30,6 +30,8 @@ export interface Config {
   notices: string[]
   /** MARVEEN_URL is plain http to a non-loopback host, allowed by CC_LINK_ALLOW_INSECURE_HTTP=1. */
   insecureHttp: boolean
+  /** Tool-name prefix (`<prefix>_message` ...), from CC_LINK_AGENT_NAME; DEFAULT_TOOL_PREFIX when unset. */
+  toolPrefix: string
 }
 
 /** A header-safe token: printable ASCII, no spaces or control characters. */
@@ -38,6 +40,27 @@ export const DEVICE_KEY_CHARSET = /^[\x21-\x7e]+$/
 export const DEFAULT_ASK_WAIT_SEC = 60
 export const DEFAULT_POLL_SEC = 15
 export const DEFAULT_FLUSH_SEC = 300
+/** Neutral tool-name prefix when CC_LINK_AGENT_NAME is unset: agent_message, agent_reply, agent_inbox. */
+export const DEFAULT_TOOL_PREFIX = 'agent'
+/** MCP tool names are capped at 64 characters; the longest suffix is `_message`. */
+export const TOOL_PREFIX_MAX = 32
+
+/**
+ * A tool-name prefix from an agent name: lowercase, every run of characters
+ * outside [a-z0-9_] becomes one '_', no leading/trailing '_', at most
+ * TOOL_PREFIX_MAX characters. Undefined when nothing is left.
+ */
+export function sanitizeToolPrefix(raw: string): string | undefined {
+  const s = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, TOOL_PREFIX_MAX)
+    .replace(/_+$/, '')
+  return s.length > 0 ? s : undefined
+}
 
 /** localhost, 127.0.0.0/8 or ::1. */
 export function isLoopbackHost(hostname: string): boolean {
@@ -47,18 +70,37 @@ export function isLoopbackHost(hostname: string): boolean {
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
 }
 
-/** Validate an http(s) URL and strip trailing slashes. Returns undefined when invalid. */
-export function normalizeBaseUrl(raw: string): string | undefined {
+/**
+ * Validate an http(s) base URL and strip trailing slashes (`https://h:3420/`
+ * and `https://h:3420//` both become `https://h:3420`). Returns an error text
+ * when it cannot be used as a base: every request path (`/api/...`) is
+ * appended to it, so a query, a fragment or a path that already ends in
+ * `/api` would turn every call into a 404.
+ */
+export function parseBaseUrl(raw: string): { url: string } | { error: string } {
   let parsed: URL
   try {
     parsed = new URL(raw.trim())
   } catch {
-    return undefined
+    return { error: 'MARVEEN_URL is not a valid http(s) base URL' }
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
-  if (parsed.search || parsed.hash) return undefined
-  return parsed.toString().replace(/\/+$/, '')
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { error: 'MARVEEN_URL is not a valid http(s) base URL' }
+  }
+  if (parsed.search || parsed.hash) {
+    return { error: 'MARVEEN_URL must not contain a query (?...) or a fragment (#...); expected e.g. https://<mini-host>:3420' }
+  }
+  const url = parsed.toString().replace(/\/+$/, '')
+  if (/\/api(\/|$)/i.test(new URL(url).pathname)) {
+    return {
+      error:
+        'MARVEEN_URL must be the dashboard base URL without /api (cc-link appends /api/... itself); ' +
+        'expected e.g. https://<mini-host>:3420',
+    }
+  }
+  return { url }
 }
+
 
 function positiveInt(
   env: Record<string, string | undefined>,
@@ -92,10 +134,11 @@ export function loadConfig(
   if (!rawUrl) {
     errors.push('MARVEEN_URL is not set (expected e.g. https://<mini-host>:3420)')
   } else {
-    url = normalizeBaseUrl(rawUrl)
-    if (!url) {
-      errors.push('MARVEEN_URL is not a valid http(s) base URL')
+    const parsedUrl = parseBaseUrl(rawUrl)
+    if ('error' in parsedUrl) {
+      errors.push(parsedUrl.error)
     } else {
+      url = parsedUrl.url
       const parsed = new URL(url)
       if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname)) {
         if (env.CC_LINK_ALLOW_INSECURE_HTTP?.trim() === '1') {
@@ -128,6 +171,22 @@ export function loadConfig(
   const mainAgentFallback = env.MARVEEN_MAIN_AGENT?.trim() || undefined
   const stateDir = env.CC_LINK_STATE_DIR?.trim() || join(home, '.cc-link')
 
+  // The prefix comes from the environment only (never from whoami): the tool
+  // list must be the same offline, and permission allowlists name the tools.
+  let toolPrefix = DEFAULT_TOOL_PREFIX
+  const rawAgentName = env.CC_LINK_AGENT_NAME?.trim()
+  if (rawAgentName) {
+    const p = sanitizeToolPrefix(rawAgentName)
+    if (!p) {
+      warnings.push(
+        `CC_LINK_AGENT_NAME=${JSON.stringify(rawAgentName)} has no letters or digits; using the tool prefix ${DEFAULT_TOOL_PREFIX}_`,
+      )
+    } else {
+      toolPrefix = p
+      if (p !== rawAgentName) notices.push(`CC_LINK_AGENT_NAME=${JSON.stringify(rawAgentName)} -> tool prefix ${p}_`)
+    }
+  }
+
   return {
     url,
     deviceKey,
@@ -142,5 +201,6 @@ export function loadConfig(
     warnings,
     notices,
     insecureHttp,
+    toolPrefix,
   }
 }

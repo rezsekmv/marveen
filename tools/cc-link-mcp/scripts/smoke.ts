@@ -1,6 +1,6 @@
 /**
  * Dry-run smoke check: spawn the server with CC_LINK_DRY_RUN=1, speak
- * JSON-RPC over stdio (initialize, tools/list, tools/call tony_note), close
+ * JSON-RPC over stdio (initialize, tools/list, tools/call agent_message), close
  * stdin and verify the process exits. No network is touched.
  *
  *   bun scripts/smoke.ts
@@ -71,20 +71,20 @@ await send({ jsonrpc: '2.0', method: 'notifications/initialized' })
 await send({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
 const list = await waitFor(2)
 const names = (list.result?.tools ?? []).map((t: { name: string }) => t.name).sort()
-check(JSON.stringify(names) === JSON.stringify(['tony_ask', 'tony_inbox', 'tony_note', 'tony_reply']), `tools/list: ${names.join(', ')}`)
+check(JSON.stringify(names) === JSON.stringify(['agent_inbox', 'agent_message', 'agent_reply']), `tools/list: ${names.join(', ')}`)
 
-await send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'tony_note', arguments: { text: 'smoke test note' } } })
+await send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'agent_message', arguments: { text: 'smoke test note' } } })
 const call = await waitFor(3)
 const text: string = call.result?.content?.[0]?.text ?? ''
-console.log('--- tony_note result ---\n' + text + '\n------------------------')
-check(!call.result?.isError, 'tony_note: not an error')
-check(text.includes('DRY RUN') && text.includes('POST /api/messages'), 'tony_note: dry-run request shown')
-check(text.includes('Bearer <redacted>'), 'tony_note: auth redacted')
-check(text.includes('[Claude Code összefoglaló]') && text.includes('Nem kell válasz.'), 'tony_note: Hungarian header')
+console.log('--- agent_message result ---\n' + text + '\n------------------------')
+check(!call.result?.isError, 'agent_message: not an error')
+check(text.includes('DRY RUN') && text.includes('POST /api/messages'), 'agent_message: dry-run request shown')
+check(text.includes('Bearer <redacted>'), 'agent_message: auth redacted')
+check(text.includes('[Claude Code üzenet]') && !text.includes('Nem kell válasz.'), 'agent_message: Hungarian header')
 
-await send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'tony_note', arguments: { text: 'key ' + 'AKIA' + 'ABCDEFGHIJKLMNOP here' } } })
+await send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'agent_message', arguments: { text: 'key ' + 'AKIA' + 'ABCDEFGHIJKLMNOP here' } } })
 const blocked = await waitFor(4)
-check(blocked.result?.isError === true && String(blocked.result?.content?.[0]?.text).includes('aws_access_key_id'), 'tony_note: secret blocked')
+check(blocked.result?.isError === true && String(blocked.result?.content?.[0]?.text).includes('aws_access_key_id'), 'agent_message: secret blocked')
 
 proc.stdin.end()
 const exitCode = await Promise.race([proc.exited, Bun.sleep(5000).then(() => 'timeout' as const)])

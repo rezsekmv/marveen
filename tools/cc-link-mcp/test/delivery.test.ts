@@ -109,8 +109,8 @@ describe('rule 1: an answer goes only to the asking session', () => {
     h.alive.add(101).add(102)
     const a = makeLink(h, { pid: 101 })
     const b = makeLink(h, { pid: 102 })
-    const ra = await a.link.callTool('tony_ask', { question: 'question from A' })
-    const rb = await b.link.callTool('tony_ask', { question: 'question from B' })
+    const ra = await a.link.callTool('agent_message', { text: 'question from A', wait: true })
+    const rb = await b.link.callTool('agent_message', { text: 'question from B', wait: true })
     expect(ra.isError).toBe(false)
     expect(rb.isError).toBe(false)
     const idA = idFrom(ra.text)
@@ -138,7 +138,7 @@ describe('rule 1: an answer goes only to the asking session', () => {
     expect(a.link.deps.asks.read()).toEqual([])
     expect(a.link.received.map(r => r.id)).toEqual([idA])
     expect(b.link.received.map(r => r.id)).toEqual([idB])
-    const inboxA = await a.link.callTool('tony_inbox')
+    const inboxA = await a.link.callTool('agent_inbox')
     expect(inboxA.text).toContain('answer for A')
     expect(inboxA.text).not.toContain('answer for B')
   })
@@ -192,8 +192,8 @@ describe('rule 2: orphan asks are adopted by a NEW session only', () => {
     const store = new AskStore(h.stateDir, id.folderKey)
     await store.add(ask(orphan.id, 777)) // dead pid, appears while 300 is running
 
-    await running.link.callTool('tony_inbox')
-    await running.link.callTool('tony_note', { text: 'a note' })
+    await running.link.callTool('agent_inbox')
+    await running.link.callTool('agent_message', { text: 'a note' })
     await running.link.pollOwnAsks()
 
     expect(running.notified).toEqual([])
@@ -243,17 +243,17 @@ describe('rule 3: folder inbox is claimed only at startup', () => {
     )
   })
 
-  test('a running session does not claim through tool calls or the watcher; tony_inbox only peeks', async () => {
+  test('a running session does not claim through tool calls or the watcher; agent_inbox only peeks', async () => {
     const id = fakeIdentity()
     h.alive.add(500)
     const s = makeLink(h, { pid: 500, identity: id })
     await s.link.startup()
     h.dash.addInbox({ content: 'arrived later', origin_note: addr(id.folderKey) })
 
-    const inbox = await s.link.callTool('tony_inbox')
-    await s.link.callTool('tony_note', { text: 'note' })
+    const inbox = await s.link.callTool('agent_inbox')
+    await s.link.callTool('agent_message', { text: 'note' })
     await s.link.pollOwnAsks()
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
 
     expect(inbox.text).toContain('folder inbox: 1 message(s) waiting')
     expect(s.notified).toEqual([])
@@ -314,7 +314,7 @@ describe('rule 4: claiming', () => {
     expect(h.dash.puts().filter(p => p.path === `/api/messages/${m.id}`).length).toBe(0)
     expect(a.notified.length + b.notified.length).toBe(0)
     expect(h.dash.rows.get(m.id)!.status).toBe('pending')
-    const inbox = await a.link.callTool('tony_inbox')
+    const inbox = await a.link.callTool('agent_inbox')
     expect(inbox.text).toContain('unaddressed')
     expect(inbox.text).toContain(framed('for anyone').split('\n')[0]!)
   })

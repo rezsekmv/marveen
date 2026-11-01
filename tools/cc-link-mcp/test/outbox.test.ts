@@ -26,7 +26,7 @@ describe('outbox', () => {
       const s = makeLink(h, { pid: 900 })
       await s.link.resolveMain(true)
       h.dash.override = c => (c.path === '/api/messages' && c.method === 'POST' ? override() : undefined)
-      const r = await s.link.callTool('tony_note', { text: 'summary body' })
+      const r = await s.link.callTool('agent_message', { text: 'summary body' })
       expect(r.isError).toBe(false)
       expect(r.text).toContain('queued in outbox (network error), will retry')
       const q = items(s.link.deps.outbox.dir)
@@ -38,8 +38,8 @@ describe('outbox', () => {
       expect(it.payload.from).toBe(SENDER)
       expect(it.payload.to).toBe(MAIN)
       expect(it.payload.origin_note).toBe(s.link.deps.identity.originNote())
-      expect(it.payload.content).toContain('[Claude Code összefoglaló]')
-      expect(it.payload.content).toContain('Nem kell válasz.')
+      expect(it.payload.content).toContain('[Claude Code üzenet]')
+      expect(it.payload.content).not.toContain('Nem kell válasz.')
       expect(it.payload.content.endsWith('summary body')).toBe(true)
       expect(r.text).toContain('outbox: 1 waiting')
     })
@@ -49,7 +49,7 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 901 })
     h.dash.override = c =>
       c.method === 'POST' ? new Response('{"error":"sender not allowed"}', { status: 403 }) : undefined
-    const r = await s.link.callTool('tony_note', { text: 'x' })
+    const r = await s.link.callTool('agent_message', { text: 'x' })
     expect(r.isError).toBe(true)
     expect(r.text).toContain('403')
     expect(r.text).toContain('sender not allowed')
@@ -60,7 +60,7 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 902 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    for (const t of ['one', 'two', 'three']) await s.link.callTool('tony_note', { text: t })
+    for (const t of ['one', 'two', 'three']) await s.link.callTool('agent_message', { text: t })
     expect(s.link.deps.outbox.count()).toBe(3)
 
     // Second POST fails with 503: first is sent and deleted, second and third stay.
@@ -72,7 +72,7 @@ describe('outbox', () => {
       }
       return undefined
     }
-    const r = await s.link.callTool('tony_inbox')
+    const r = await s.link.callTool('agent_inbox')
     const sent = h.dash.posts().filter(c => c.body && c.who === '902')
     const okBodies = [...h.dash.rows.values()].map(row => row.content)
     expect(okBodies.length).toBe(1)
@@ -84,7 +84,7 @@ describe('outbox', () => {
 
     // Back online: the rest goes out in order.
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     expect([...h.dash.rows.values()].map(row => row.content.split('\n').pop())).toEqual(['one', 'two', 'three'])
     expect(s.link.deps.outbox.count()).toBe(0)
   })
@@ -93,14 +93,14 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 903 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'a' })
-    await s.link.callTool('tony_note', { text: 'b' })
+    await s.link.callTool('agent_message', { text: 'a' })
+    await s.link.callTool('agent_message', { text: 'b' })
     const counts: number[] = []
     h.dash.override = c => {
       if (c.method === 'POST') counts.push(s.link.deps.outbox.count())
       return undefined
     }
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     expect(counts).toEqual([2, 1])
   })
 
@@ -109,13 +109,13 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 904 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    const r = await s.link.callTool('tony_ask', { question: 'what is up?' })
+    const r = await s.link.callTool('agent_message', { text: 'what is up?', wait: true })
     expect(r.isError).toBe(false)
     expect(r.text).toContain('queued')
     expect(s.link.deps.asks.read()).toEqual([])
 
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     const asks = s.link.deps.asks.read()
     expect(asks.length).toBe(1)
     expect(asks[0]!.pid).toBe(904)
@@ -129,9 +129,9 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 905 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'BODY-MARKER-4XX' })
+    await s.link.callTool('agent_message', { text: 'BODY-MARKER-4XX' })
     h.dash.override = c => (c.method === 'POST' ? new Response('{"error":"bad request"}', { status: 400 }) : undefined)
-    const r = await s.link.callTool('tony_inbox')
+    const r = await s.link.callTool('agent_inbox')
     const ob = s.link.deps.outbox
     expect(ob.count()).toBe(0)
     expect(readdirSync(ob.rejectedDir).length).toBe(1)
@@ -142,7 +142,7 @@ describe('outbox', () => {
     expect(r.text).toContain('rejected by the server')
     // Reported once, not on every later call.
     h.dash.override = undefined
-    const r2 = await s.link.callTool('tony_inbox')
+    const r2 = await s.link.callTool('agent_inbox')
     expect(r2.text).not.toContain('rejected by the server')
   })
 
@@ -157,7 +157,7 @@ describe('outbox', () => {
       payload: { from: SENDER, to: MAIN, content: 'old', origin_note: 'n' },
     })
     h.dash.override = () => 'network'
-    const r = await s.link.callTool('tony_inbox')
+    const r = await s.link.callTool('agent_inbox')
     expect(r.text).toContain('1 outbox item(s) older than 7 days')
     expect(r.text).toContain('outbox: 1 waiting')
     expect(s.link.deps.outbox.count()).toBe(1)
@@ -167,10 +167,10 @@ describe('outbox', () => {
     const s = makeLink(h, { pid: 907 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'BODY-MARKER-FLUSH' })
-    await s.link.callTool('tony_inbox') // flush attempt 1 (fails)
+    await s.link.callTool('agent_message', { text: 'BODY-MARKER-FLUSH' })
+    await s.link.callTool('agent_inbox') // flush attempt 1 (fails)
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox') // flush attempt 2 (sends)
+    await s.link.callTool('agent_inbox') // flush attempt 2 (sends)
     const log = readFileSync(join(s.link.deps.outbox.dir, 'flush.log'), 'utf8').trim().split('\n')
     expect(log.length).toBeGreaterThanOrEqual(2)
     expect(log.at(-1)).toMatch(/^\d{4}-\d\d-\d\dT.*sent=1 failed=0 rejected=0 remaining=0$/)
@@ -182,10 +182,10 @@ describe('outbox', () => {
   test('dry run sends nothing and shows Bearer <redacted>', async () => {
     const s = makeLink(h, { pid: 908, env: { CC_LINK_DRY_RUN: '1' } })
     await s.link.startup()
-    const note = await s.link.callTool('tony_note', { text: 'dry note body' })
-    const askR = await s.link.callTool('tony_ask', { question: 'dry question' })
-    const reply = await s.link.callTool('tony_reply', { id: 5 })
-    const inbox = await s.link.callTool('tony_inbox')
+    const note = await s.link.callTool('agent_message', { text: 'dry note body' })
+    const askR = await s.link.callTool('agent_message', { text: 'dry question', wait: true })
+    const reply = await s.link.callTool('agent_reply', { id: 5 })
+    const inbox = await s.link.callTool('agent_inbox')
     expect(h.dash.calls).toEqual([])
     for (const r of [note, askR]) {
       expect(r.isError).toBe(false)

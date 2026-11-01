@@ -3,11 +3,11 @@
  * cc-link: stdio MCP server + Claude Code channel.
  *
  * Links a Claude Code session on a laptop to the Marveen main agent through
- * the dashboard's message API: one-way notes, questions with answers, and
- * messages the main agent initiates. Answers and inbox messages are pushed
- * with `notifications/claude/channel`; everything pushed is also available via
- * tony_inbox, because a session that did not load the server as a channel
- * drops those notifications silently.
+ * the dashboard's message API: messages (optionally waiting for the answer),
+ * answers to any of them, and messages the main agent initiates. Answers and
+ * inbox messages are pushed with `notifications/claude/channel`; everything
+ * pushed is also available via <prefix>_inbox, because a session that did not
+ * load the server as a channel drops those notifications silently.
  *
  * stdout is the MCP transport: log to stderr only.
  */
@@ -17,6 +17,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { loadConfig } from './config.ts'
 import { buildInstructions, SERVER_NAME } from './instructions.ts'
 import { createLink, MAX_TEXT } from './link.ts'
+import { toolDefinitions } from './tools.ts'
 
 
 const log = (msg: string) => process.stderr.write(`${SERVER_NAME}: ${msg}\n`)
@@ -40,54 +41,12 @@ const mcp = new Server(
       tools: {},
       experimental: { 'claude/channel': {} },
     },
-    instructions: buildInstructions(config.askWaitSec),
+    instructions: buildInstructions(config.askWaitSec, link.tools),
   },
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'tony_note',
-      description:
-        'Send the main agent a one-way summary of this session (no answer expected). Queued and retried if the dashboard is unreachable.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: `The summary, at most ${MAX_TEXT} characters. No secrets.` },
-        },
-        required: ['text'],
-      },
-    },
-    {
-      name: 'tony_ask',
-      description:
-        'Ask the main agent a question. Waits briefly for the answer; a later answer arrives as a channel event or via tony_reply / tony_inbox.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: `The question, at most ${MAX_TEXT} characters. No secrets.` },
-        },
-        required: ['question'],
-      },
-    },
-    {
-      name: 'tony_reply',
-      description: "Fetch the status and answer of one of this folder's asks by message id.",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          id: { type: 'integer', description: 'The message id returned by tony_ask.' },
-        },
-        required: ['id'],
-      },
-    },
-    {
-      name: 'tony_inbox',
-      description:
-        'List what this session received from the main agent, asks still waiting for an answer, and messages waiting for the next new session in this folder.',
-      inputSchema: { type: 'object', properties: {} },
-    },
-  ],
+  tools: toolDefinitions(link.tools, MAX_TEXT, config.askWaitSec),
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {

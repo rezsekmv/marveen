@@ -21,10 +21,10 @@ describe('config', () => {
       const s = makeLink(h, { pid: 2000, config: cfg })
       await s.link.startup() // must not throw
       for (const [tool, args] of [
-        ['tony_note', { text: 'x' }],
-        ['tony_ask', { question: 'x' }],
-        ['tony_reply', { id: 1 }],
-        ['tony_inbox', {}],
+        ['agent_message', { text: 'x' }],
+        ['agent_message', { text: 'x', wait: true }],
+        ['agent_reply', { id: 1 }],
+        ['agent_inbox', {}],
       ] as const) {
         const r = await s.link.callTool(tool, args)
         expect(r.isError).toBe(true)
@@ -50,9 +50,9 @@ describe('config', () => {
     h.dash.mainAgentId = 'graph-main'
     const s = makeLink(h, { pid: 2001, env: { MARVEEN_MAIN_AGENT: 'env-main' } })
     await s.link.startup()
-    const inbox = await s.link.callTool('tony_inbox')
+    const inbox = await s.link.callTool('agent_inbox')
     expect(inbox.text).toContain('main agent: graph-main (source: graph)')
-    await s.link.callTool('tony_note', { text: 'hi' })
+    await s.link.callTool('agent_message', { text: 'hi' })
     expect(h.dash.posts()[0]!.body.to).toBe('graph-main')
     expect(h.dash.calls.some(c => c.path === '/api/team/graph')).toBe(true)
   })
@@ -61,9 +61,9 @@ describe('config', () => {
     h.dash.override = c => (c.path === '/api/team/graph' ? new Response('{"error":"x"}', { status: 500 }) : undefined)
     const s = makeLink(h, { pid: 2002, env: { MARVEEN_MAIN_AGENT: 'env-main' } })
     await s.link.startup()
-    const inbox = await s.link.callTool('tony_inbox')
+    const inbox = await s.link.callTool('agent_inbox')
     expect(inbox.text).toContain('main agent: env-main (source: env)')
-    await s.link.callTool('tony_note', { text: 'hi' })
+    await s.link.callTool('agent_message', { text: 'hi' })
     expect(h.dash.posts()[0]!.body.to).toBe('env-main')
   })
 
@@ -71,14 +71,14 @@ describe('config', () => {
     h.dash.mainAgentId = null
     const s = makeLink(h, { pid: 2003, env: { MARVEEN_MAIN_AGENT: MAIN } })
     await s.link.startup()
-    expect((await s.link.callTool('tony_inbox')).text).toContain(`main agent: ${MAIN} (source: env)`)
+    expect((await s.link.callTool('agent_inbox')).text).toContain(`main agent: ${MAIN} (source: env)`)
   })
 
   test('both sources fail: sending returns an error, nothing is posted or queued', async () => {
     h.dash.override = c => (c.path === '/api/team/graph' ? 'network' : undefined)
     const s = makeLink(h, { pid: 2004 })
     await s.link.startup()
-    const r = await s.link.callTool('tony_note', { text: 'hi' })
+    const r = await s.link.callTool('agent_message', { text: 'hi' })
     expect(r.isError).toBe(true)
     expect(r.text).toContain('MARVEEN_MAIN_AGENT')
     expect(h.dash.posts()).toEqual([])
@@ -113,7 +113,7 @@ describe('server process with missing config', () => {
       params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } },
     })
     send({ jsonrpc: '2.0', method: 'notifications/initialized' })
-    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'tony_note', arguments: { text: 'x' } } })
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'agent_message', arguments: { text: 'x' } } })
     await proc.stdin.flush()
 
     const reader = proc.stdout.getReader()

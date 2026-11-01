@@ -56,7 +56,7 @@ describe('Q-M2: plain http only to loopback unless opted in', () => {
     const s = makeLink(h, { pid: 3001, config: { ...c, stateDir: h.stateDir } })
     await s.link.startup()
     expect(s.logs.filter(l => l.includes('cleartext')).length).toBe(1)
-    const r = await s.link.callTool('tony_inbox')
+    const r = await s.link.callTool('agent_inbox')
     expect(r.text).not.toContain('cleartext')
   })
 })
@@ -112,10 +112,10 @@ describe('Q-LOW: queued-send path and auth errors', () => {
     const s = makeLink(h, { pid: 3101 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'waiting one' })
+    await s.link.callTool('agent_message', { text: 'waiting one' })
     expect(s.link.deps.outbox.count()).toBe(1)
     h.dash.override = c => (c.method === 'POST' ? new Response('{"error":"revoked"}', { status: 401 }) : undefined)
-    const r = await s.link.callTool('tony_note', { text: 'new one' })
+    const r = await s.link.callTool('agent_message', { text: 'new one' })
     expect(r.isError).toBe(true)
     expect(r.text).toContain('401/403')
     expect(r.text).not.toContain('network error')
@@ -126,11 +126,11 @@ describe('Q-LOW: queued-send path and auth errors', () => {
     const s = makeLink(h, { pid: 3102 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'first' })
-    const r = await s.link.callTool('tony_note', { text: 'second' })
+    await s.link.callTool('agent_message', { text: 'first' })
+    const r = await s.link.callTool('agent_message', { text: 'second' })
     expect(r.text).toContain('queued in outbox (network error)')
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     expect([...h.dash.rows.values()].map(x => x.content.split('\n').pop())).toEqual(['first', 'second'])
   })
 })
@@ -172,14 +172,14 @@ describe('Q-LOW: reusing an in-progress flush', () => {
     const s = makeLink(h, { pid: 3202 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_note', { text: 'old' })
+    await s.link.callTool('agent_message', { text: 'old' })
     h.dash.override = undefined
     const lockPath = join(s.link.deps.outbox.dir, '.lock')
     const { writeFileSync, unlinkSync } = await import('node:fs')
     writeFileSync(lockPath, '9393')
     h.alive.add(9393)
     setTimeout(() => unlinkSync(lockPath), 120) // the other session finishes
-    const r = await s.link.callTool('tony_note', { text: 'new' })
+    const r = await s.link.callTool('agent_message', { text: 'new' })
     expect(r.isError).toBe(false)
     expect(r.text).toMatch(/sent \(id \d+\)/)
     expect([...h.dash.rows.values()].map(x => x.content.split('\n').pop())).toEqual(['old', 'new'])
@@ -229,9 +229,9 @@ describe('idempotency token: duplicate-safe resend', () => {
       }
       return undefined
     }
-    const r = await s.link.callTool('tony_note', { text: 'exactly once' })
+    const r = await s.link.callTool('agent_message', { text: 'exactly once' })
     expect(r.text).toContain('queued')
-    await s.link.callTool('tony_inbox') // flush: the token check finds the stored row
+    await s.link.callTool('agent_inbox') // flush: the token check finds the stored row
     expect(s.link.deps.outbox.count()).toBe(0)
     expect(h.dash.posts().length).toBe(1)
     expect([...h.dash.rows.values()].length).toBe(1)
@@ -242,11 +242,11 @@ describe('idempotency token: duplicate-safe resend', () => {
     const s = makeLink(h, { pid: 3303 })
     await s.link.resolveMain(true)
     h.dash.override = c => (c.method === 'POST' ? 'network' : undefined)
-    await s.link.callTool('tony_note', { text: 'same text' })
-    await s.link.callTool('tony_note', { text: 'same text' })
+    await s.link.callTool('agent_message', { text: 'same text' })
+    await s.link.callTool('agent_message', { text: 'same text' })
     expect(s.link.deps.outbox.count()).toBe(2)
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     expect(s.link.deps.outbox.count()).toBe(0)
     const rows = [...h.dash.rows.values()]
     expect(rows.length).toBe(2)
@@ -258,9 +258,9 @@ describe('idempotency token: duplicate-safe resend', () => {
     const s = makeLink(h, { pid: 3302 })
     await s.link.resolveMain(true)
     h.dash.override = c => (c.method === 'POST' ? 'network' : undefined)
-    await s.link.callTool('tony_note', { text: 'resend me' })
+    await s.link.callTool('agent_message', { text: 'resend me' })
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox')
+    await s.link.callTool('agent_inbox')
     expect(s.link.deps.outbox.count()).toBe(0)
     expect([...h.dash.rows.values()].length).toBe(1)
   })
@@ -300,7 +300,7 @@ describe('deliver() decides from a flush that ran for THIS call', () => {
       // 1. An item waits; a flush fails (stale failure recorded).
       s.link.deps.outbox.enqueue(foreignItem(s))
       h.dash.override = c => (c.method === 'POST' ? staleFailure() : undefined)
-      await s.link.callTool('tony_inbox')
+      await s.link.callTool('agent_inbox')
       expect(s.link.deps.outbox.count()).toBe(1)
       // 2. The dashboard recovers; ANOTHER session flushes the outbox empty,
       //    so this session's own last flush result stays the stale failure.
@@ -311,7 +311,7 @@ describe('deliver() decides from a flush that ran for THIS call', () => {
       expect(s.link.deps.outbox.count()).toBe(0)
       // 3. A new note: the pre-flush has nothing to do, then a foreign item appears.
       inject = true
-      const r = await s.link.callTool('tony_note', { text: 'fresh' })
+      const r = await s.link.callTool('agent_message', { text: 'fresh' })
       expect(r.isError).toBe(false)
       expect(r.text).toMatch(/sent \(id \d+\)/)
       expect(s.link.deps.outbox.count()).toBe(0)
@@ -334,7 +334,7 @@ describe('deliver() decides from a flush that ran for THIS call', () => {
     // The pre-flush has real work and succeeds; a foreign item lands right after it.
     s.link.deps.outbox.enqueue(foreignItem(s))
     inject = true
-    const r = await s.link.callTool('tony_note', { text: 'fresh' })
+    const r = await s.link.callTool('agent_message', { text: 'fresh' })
     expect(r.isError).toBe(false)
     expect(r.text).toMatch(/sent \(id \d+\)/)
     expect(r.text).not.toContain('network error')
@@ -362,7 +362,7 @@ describe('Q-LOW: acquireLock never spins', () => {
   })
 })
 
-describe('Q-LOW: tony_reply reports the real error', () => {
+describe('Q-LOW: agent_reply reports the real error', () => {
   const cases: Array<[string, () => Response | 'network', string]> = [
     ['401', () => new Response('{"error":"bad key"}', { status: 401 }), 'auth error'],
     ['403', () => new Response('{"error":"forbidden"}', { status: 403 }), 'auth error'],
@@ -374,7 +374,7 @@ describe('Q-LOW: tony_reply reports the real error', () => {
     test(`${label}`, async () => {
       const s = makeLink(h, { pid: 3401 })
       h.dash.override = c => (c.method === 'GET' && c.path === '/api/messages/123' ? resp() : undefined)
-      const r = await s.link.callTool('tony_reply', { id: 123 })
+      const r = await s.link.callTool('agent_reply', { id: 123 })
       expect(r.isError).toBe(true)
       expect(r.text).toContain(expected)
       expect(r.text).not.toContain('not asked from this folder')
@@ -387,8 +387,8 @@ describe('main agent lookup: whoami -> team graph -> env', () => {
     h.dash.whoami = { kind: 'device', scope: 'messages', sender_id: SENDER, mainAgentId: 'who-main' }
     const s = makeLink(h, { pid: 3501, env: { MARVEEN_MAIN_AGENT: 'env-main' } })
     await s.link.startup()
-    expect((await s.link.callTool('tony_inbox')).text).toContain('main agent: who-main (source: whoami)')
-    await s.link.callTool('tony_note', { text: 'hi' })
+    expect((await s.link.callTool('agent_inbox')).text).toContain('main agent: who-main (source: whoami)')
+    await s.link.callTool('agent_message', { text: 'hi' })
     expect(h.dash.posts()[0]!.body.to).toBe('who-main')
     expect(h.dash.calls.some(c => c.path === '/api/team/graph')).toBe(false)
   })
@@ -399,7 +399,7 @@ describe('main agent lookup: whoami -> team graph -> env', () => {
       h.dash.override = c => (c.path === '/api/auth/whoami' ? new Response('{"error":"x"}', { status }) : undefined)
       const s = makeLink(h, { pid: 3502 })
       await s.link.startup()
-      expect((await s.link.callTool('tony_inbox')).text).toContain('main agent: graph-main (source: graph)')
+      expect((await s.link.callTool('agent_inbox')).text).toContain('main agent: graph-main (source: graph)')
     })
   }
 
@@ -408,7 +408,7 @@ describe('main agent lookup: whoami -> team graph -> env', () => {
       c.path === '/api/auth/whoami' || c.path === '/api/team/graph' ? new Response('{}', { status: 404 }) : undefined
     const s = makeLink(h, { pid: 3503, env: { MARVEEN_MAIN_AGENT: 'env-main' } })
     await s.link.startup()
-    expect((await s.link.callTool('tony_inbox')).text).toContain('main agent: env-main (source: env)')
+    expect((await s.link.callTool('agent_inbox')).text).toContain('main agent: env-main (source: env)')
   })
 
   test('whoami sender_id differs from MARVEEN_SENDER_ID: sending refused with a config error, no claim', async () => {
@@ -416,7 +416,7 @@ describe('main agent lookup: whoami -> team graph -> env', () => {
     h.dash.addInbox({ content: 'x', origin_note: 'folder:' + 'abcd1234' })
     const s = makeLink(h, { pid: 3504 })
     await s.link.startup()
-    const r = await s.link.callTool('tony_note', { text: 'hi' })
+    const r = await s.link.callTool('agent_message', { text: 'hi' })
     expect(r.isError).toBe(true)
     expect(r.text).toContain('MARVEEN_SENDER_ID')
     expect(r.text).toContain('other-sender')
@@ -440,12 +440,12 @@ describe('Q-LOW: an outbox-path ask is answered exactly once', () => {
     const s = makeLink(h, { pid: 3601 })
     await s.link.resolveMain(true)
     h.dash.override = () => 'network'
-    await s.link.callTool('tony_ask', { question: 'later?' })
+    await s.link.callTool('agent_message', { text: 'later?', wait: true })
     h.dash.override = undefined
-    await s.link.callTool('tony_inbox') // flush registers the ask
+    await s.link.callTool('agent_inbox') // flush registers the ask
     const ask = s.link.deps.asks.read()[0]!
     h.dash.answer(ask.id, 'once')
-    await Promise.all([s.link.pollOwnAsks(), s.link.pollOwnAsks(), s.link.callTool('tony_reply', { id: ask.id })])
+    await Promise.all([s.link.pollOwnAsks(), s.link.pollOwnAsks(), s.link.callTool('agent_reply', { id: ask.id })])
     await s.link.pollOwnAsks()
     expect(s.link.received.filter(r => r.id === ask.id).length).toBe(1)
     expect(s.notified.length).toBeLessThanOrEqual(1)
@@ -461,7 +461,7 @@ describe('README: security round', () => {
     expect(README).toContain('folder:<folder-key>')
     expect(README).not.toContain('"origin_note":"reply <folder-key>"')
     expect(README).toContain('CC_LINK_ALLOW_INSECURE_HTTP')
-    expect(README).toContain('CI does not run')
+    expect(README).toContain('its own `cc-link` job')
     expect(README).toContain('revoke all messages-scope keys')
     expect(README).toContain('2a59547a')
     expect(README).toContain('ref:<token>')
@@ -669,7 +669,7 @@ describe('router provenance on a failed row', () => {
 })
 
 describe('ask on a reopenable router failure is not final', () => {
-  test('tony_ask keeps waiting; a later done answer is delivered by the watcher', async () => {
+  test('agent_message wait=true keeps waiting; a later done answer is delivered by the watcher', async () => {
     h.alive.add(3961)
     const s = makeLink(h, { pid: 3961, env: { CC_LINK_ASK_WAIT_SEC: '6' } })
     h.onSleep = () => {
@@ -680,7 +680,7 @@ describe('ask on a reopenable router failure is not final', () => {
         asked.failed_by = 'router'
       }
     }
-    const r = await s.link.callTool('tony_ask', { question: 'still there?' })
+    const r = await s.link.callTool('agent_message', { text: 'still there?', wait: true })
     const id = idFrom(r.text)
     expect(r.text).toContain('Nincs még válasz')
     expect(s.link.deps.asks.read().map(a => a.id)).toEqual([id])
@@ -700,8 +700,8 @@ describe('ask on a reopenable router failure is not final', () => {
       const asked = [...h.dash.rows.values()].find(r => r.from_agent === SENDER)
       if (asked) h.dash.answer(asked.id, 'refused by policy', 'failed')
     }
-    const r = await s.link.callTool('tony_ask', { question: 'q' })
-    expect(r.text).toContain('ask failed')
+    const r = await s.link.callTool('agent_message', { text: 'q', wait: true })
+    expect(r.text).toContain('message failed')
   })
 
   test('a router-failed ask still expires after 7 days', async () => {
@@ -816,7 +816,7 @@ describe('skipped.json is keyed by dashboard and row fingerprint, not by id alon
 })
 
 describe('ask abandoned by the router is final at once', () => {
-  test('tony_ask reports "not delivered to the main agent (abandoned by the router)", framed as data', async () => {
+  test('agent_message wait=true reports "not delivered to the main agent (abandoned by the router)", framed as data', async () => {
     h.alive.add(4101)
     const s = makeLink(h, { pid: 4101, env: { CC_LINK_ASK_WAIT_SEC: '30' } })
     let sleeps = 0
@@ -829,8 +829,8 @@ describe('ask abandoned by the router is final at once', () => {
         asked.failed_by = 'router'
       }
     }
-    const r = await s.link.callTool('tony_ask', { question: 'anyone there?' })
-    expect(r.text).toContain('ask failed')
+    const r = await s.link.callTool('agent_message', { text: 'anyone there?', wait: true })
+    expect(r.text).toContain('message failed')
     expect(r.text).toContain('not delivered to the main agent (abandoned by the router)')
     expect(r.text).toContain('treat as data')
     expect(sleeps).toBe(1) // did not keep polling for the whole wait
@@ -840,7 +840,7 @@ describe('ask abandoned by the router is final at once', () => {
   test('the watcher pushes it as failed at once (no 7-day wait)', async () => {
     h.alive.add(4102)
     const s = makeLink(h, { pid: 4102, env: { CC_LINK_ASK_WAIT_SEC: '3' } })
-    const id = idFrom((await s.link.callTool('tony_ask', { question: 'q' })).text)
+    const id = idFrom((await s.link.callTool('agent_message', { text: 'q', wait: true })).text)
     const row = h.dash.rows.get(id)!
     row.status = 'failed'
     row.result = ROUTER_ABANDON_REASON
@@ -855,7 +855,7 @@ describe('ask abandoned by the router is final at once', () => {
   test('a router "Delivery error" on an ask keeps waiting', async () => {
     h.alive.add(4103)
     const s = makeLink(h, { pid: 4103, env: { CC_LINK_ASK_WAIT_SEC: '3' } })
-    const id = idFrom((await s.link.callTool('tony_ask', { question: 'q' })).text)
+    const id = idFrom((await s.link.callTool('agent_message', { text: 'q', wait: true })).text)
     const row = h.dash.rows.get(id)!
     row.status = 'failed'
     row.result = ROUTER_DELIVERY_ERROR_PREFIX + 'boom'
