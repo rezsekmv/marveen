@@ -24,6 +24,7 @@ Ezek a fájlok a dashboard által kezelt, futásidőben módosuló konfiguráci�
 | `store/custom-providers.json` | dashboard UI (Beállítások > Provider-ok) | Egyéni Anthropic Messages API-kompatibilis végpontok listája -- ld. docs/custom-providers.md |
 | `store/config-overrides.json` | dashboard UI | Beállítások-oldal által mentett felülbírálatok (plain értékek, sosem tartalmaz titkokat) |
 | `store/update.pid` | automatikus | Frissítési folyamat PID fájl (concurrency lock) |
+| `store/self-pace-exceptions.json` | kézzel (a gazda vagy a fő ágens) | Opcionális, telepítés-helyi kivételek a sub-ágensek self-pace kapujához; védett store-fájl (a sub-ágensek közvetlen írását a kapu tiltja) -- ld. [self-pace-exceptions.json struktúra](#self-pace-exceptionsjson-struktúra) |
 | `store/telegram-topics.json` | `/topic new <név>` (Telegram) | A fő chat elnevezett témái: `{ "chatId", "topics": { "<név>": <message_thread_id> } }` (0600); csak `TELEGRAM_TOPICS_ENABLED` mellett íródik |
 
 ### A dashboard nyelve
@@ -350,6 +351,41 @@ FROM config_change_log ORDER BY created_at DESC LIMIT 20;
 ```
 
 Autonómia szintek: `1` = csak jelez, `2` = javasol + jóváhagyás kell, `3` = autonóm + utólag jelent. `locked: true` esetén max szint 1 (hard safety szabály miatt nem emelhető).
+
+---
+
+### self-pace-exceptions.json struktúra
+
+A sub-ágensek self-pace kapuja (`scripts/self-pace-gate.mjs`) minden író `launchctl` alparancsot tilt. Ez az opcionális fájl EGY szűk kivételt ad, amit a `scripts/self-pace-local-exceptions.mjs` olvas: a felsorolt ágens újraindíthatja (kickstart) a gazda saját launchd szolgáltatásait.
+
+```json
+{
+  "launchctlKickstart": {
+    "ops-agent": ["com.example."]
+  }
+}
+```
+
+Ezzel a fájllal az az ágens, amelynek projektkönyvtára `agents/ops-agent`, pontosan ezt futtathatja:
+
+```sh
+launchctl kickstart gui/<uid>/com.example.<név>
+launchctl kickstart -k gui/<uid>/com.example.<név>
+```
+
+(`/bin/launchctl` alakban is). Szabályok:
+
+- A TELJES Bash-parancs ez az egy hívás, a szavak között sima szóközzel: nincs `;`, `&&`, `||`, `|`, `&`, sortörés, átirányítás, subshell, `$`, backtick, idézőjel, backslash, glob, `sudo` vagy `VAR=érték` előtag. Minden más alakot a kapu pontosan úgy ítél meg, mintha a fájl nem létezne.
+- Az `<uid>` annak a felhasználónak a numerikus uid-je, akinek a nevében a hook fut; csak a `gui/` domain elfogadott (a `system/`, `user/` és a többi nem).
+- A címke (label) csak kisbetűs lehet: az egész címkében csak `a-z`, `0-9`, `.` és `-` szerepelhet (nincs nagybetű, `_`, `@` vagy bármi más). Az a szolgáltatás, amelynek a címkéje ebbe nem fér bele, nem engedélyezhető.
+- A `<név>` a beállított előtag után a `[a-z0-9][a-z0-9.-]*` mintára illeszkedik. Az előtag legalább KÉT, ponttal lezárt tagból áll (`[a-z0-9][a-z0-9-]*.` ismételve, pl. `com.example.`); az egytagú előtag (`com.`, `hu.`) elutasítva, az érvénytelen bejegyzések figyelmen kívül maradnak.
+- Az előtag NEM fedheti át a telepítés saját launchd címkéit (a dashboard, a csatornák és az ágensek szolgáltatásai, pl. `com.marveen.`): ezek újraindításával egy sub-ágens újraindíthatná a dashboardot, a kapukat vagy egy másik ágenst, vagyis felébreszthetné saját magát vagy egy társát, és pont ezt a self-pace-t hivatott a kapu megállítani.
+- A kickstart kapcsolói közül csak a `-k` elfogadott; a `-p`, a `-s` és minden más `launchctl` alparancs továbbra is tiltott.
+- Hiányzó, olvashatatlan, symlinkelt vagy hibás fájl esetén nincs kivétel (fail closed). Az útvonal rögzített (a kapu melletti `store/`); környezeti változó nem helyezheti át.
+- Ha maga a `scripts/self-pace-local-exceptions.mjs` hiányzik vagy hibás, a kapu ugyanúgy fut, csak kivétel nélkül.
+- A kivétel kizárólag a `launchctl` ütemező-tiltást oldja fel. A kapu minden más ellenőrzése (védett store-fájlok, az ütemezési felület, tmux-injektálás, ...) ugyanarra a parancsra továbbra is lefut.
+- A fájl ugyanennek a kapunak védett store-fájlja, és pontosan ugyanazt a védelmet kapja, mint a többi: bármely sub-ágens (a felsorolt is) közvetlen írását, mozgatását, törlését vagy a fájlba irányított kimenetét (Bash-sel vagy a Write/Edit eszközökkel) a kapu tiltja; olvasni szabad. Írója a gazda és a fő ágens. Ez a védelem az egyszerű utakat fogja meg, nem sandbox: ma nem veszi észre az idézőjelekkel szétszedett nevet (`self-pace-exceptions"".json`) és a rövid globot (`store/self*`), ugyanúgy, ahogy a többi védett store-fájlnál sem; ezt egy külön keményítő feladat zárja le.
+- Mélységi védelem: a kapu maga is ellenőrzi a szigorú `launchctl kickstart` alakot, mielőtt a modult megkérdezné, így egy hibás vagy kicserélt modul sem mentesíthet semmilyen más parancsot.
 
 ---
 
