@@ -35,6 +35,18 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
+// Install-local exceptions (see the LOCAL EXCEPTION HOOK in decide()). Loaded DEFENSIVELY:
+// a static import of a missing or broken module would crash this gate (and every gate that
+// imports it) with exit 1, which PreToolUse reads as non-blocking, i.e. FAIL OPEN. A missing
+// or broken module must mean "no exception", never "no gate".
+let launchctlKickstartExempt = () => false
+// The only command shape the module may ever exempt, checked by the gate itself on the WHOLE
+// raw command: one `launchctl kickstart [-k] gui/<uid>/<label>`, [a-z0-9/.-] and spaces only.
+const KICKSTART_SHAPE_RX = /^ *(?:\/bin\/)?launchctl +kickstart +(?:-k +)?gui\/[0-9]+\/[a-z0-9.-]+ *$/
+try {
+  const mod = await import('./self-pace-local-exceptions.mjs')
+  if (typeof mod.launchctlKickstartExempt === 'function') launchctlKickstartExempt = mod.launchctlKickstartExempt
+} catch { /* no exception */ }
 
 // The allowlist this install's egress-gate.mjs reads (scripts/ -> repo root -> store/).
 const DEFAULT_ALLOWLIST_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'store', 'egress-allowlist.json')
@@ -185,6 +197,8 @@ export function allowlistBashSegmentAllowed(seg) {
 //                                     no per-letter approval (email-approval-gate.py)
 //   .approval-bot-token, .approval-bot-key -- the owner's approval bot and the key its button data is
 //                                     signed with (src/approval-bot.ts, #2160)
+//   self-pace-exceptions.json      -- the install-local exceptions to THIS gate
+//                                     (scripts/self-pace-local-exceptions.mjs)
 // Their writers are the owner, the main agent and, for config-overrides.json, the dashboard
 // process; none of them runs this gate. Unlike the allowlist, these have no hash baseline yet,
 // so what this gate cannot see (a path built at runtime) is not reported after the fact.
@@ -196,13 +210,14 @@ export const PROTECTED_STORE_FILES = new Set([
   'email-standing-recipients.json',
   '.approval-bot-token',
   '.approval-bot-key',
+  'self-pace-exceptions.json',
 ])
 // The file, or a glob that starts on its name. The prefixes are long enough that this gate's
 // and the features' own sources (bash-sandbox.ts, config-registry.ts) stay out of it; the
 // approval-bot files need their leading dot, so a source or doc named approval-bot-key-*.md or a
 // glob over src/approval-bot* stays out too.
 const PROTECTED_MENTION_RX =
-  /(?:egress[-_]?vendor[-_]?hosts|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients)\.json|\.approval[-_]?bot[-_]?(?:token|key)\b|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing|\.approval[-_]?bot)[\w.-]*[*?[]/i
+  /(?:egress[-_]?vendor[-_]?hosts|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients|self[-_]?pace[-_]?exceptions)\.json|\.approval[-_]?bot[-_]?(?:token|key)\b|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing|\.approval[-_]?bot|self[-_]?pace[-_]?exc)[\w.-]*[*?[]/i
 
 // One rule for every protected store object: a segment that mentions it may only be a plain
 // READ, and no output redirect in it may point at it (or at a target built at runtime).
@@ -1736,7 +1751,17 @@ function decide(toolName, toolInput, opts = {}) {
     const masked = maskInertLiterals(safeCommand)
     for (const seg of (masked == null ? naiveSegs : splitSegments(masked))) {
       // scheduler binaries: deny the exec/submit forms, allow pure read-listing
-      if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) return { deny: true }
+      if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) {
+        // LOCAL EXCEPTION HOOK (scripts/self-pace-local-exceptions.mjs): skip ONLY this
+        // deny when the ENTIRE raw command is one `launchctl kickstart [-k] gui/<uid>/<label>`
+        // that store/self-pace-exceptions.json grants to this agent. Every check above has
+        // already run on the same command, so no other deny reason can be bypassed here.
+        // Defense in depth: the gate itself first checks the strict kickstart SHAPE, so a
+        // buggy or replaced module can never exempt any other command.
+        const raw = String(toolInput?.command ?? '')
+        if (KICKSTART_SHAPE_RX.test(raw) && launchctlKickstartExempt(raw, opts) === true) continue
+        return { deny: true }
+      }
     }
   }
   return { deny: false }
@@ -1769,7 +1794,8 @@ const ALLOWLIST_GATE_MSG =
 const PROTECTED_STORE_GATE_MSG =
   'Vedett store-fajl TILTOTT (governance hard-gate). Sub-agentkent NEM irhatod a ' +
   'store/egress-vendor-hosts.json, store/config-overrides.json, store/bash-sandbox-write-paths.json, ' +
-  'store/email-standing-recipients.json, store/.approval-bot-token es store/.approval-bot-key ' +
+  'store/email-standing-recipients.json, store/.approval-bot-token, store/.approval-bot-key es ' +
+  'store/self-pace-exceptions.json ' +
   'fajlt: mindegyik RAD vonatkozo kapu beallitasa. ' +
   'Ha valtoztatas kell, kerd a fo agenst (inter-agent uzenet: mit es miert); o a gazda ' +
   'jovahagyasaval irja. Olvasni szabad: cat / grep / jq a fajlra (ertelmezo -- python, node -- nem).'

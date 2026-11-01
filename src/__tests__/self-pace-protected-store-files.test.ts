@@ -16,7 +16,9 @@ import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 
 const FILES = ['egress-vendor-hosts.json', 'config-overrides.json', 'bash-sandbox-write-paths.json', 'email-standing-recipients.json',
-  '.approval-bot-token', '.approval-bot-key']
+  '.approval-bot-token', '.approval-bot-key',
+  // the install-local exceptions to the gate itself (scripts/self-pace-local-exceptions.mjs)
+  'self-pace-exceptions.json']
 
 let root: string
 let store: string
@@ -32,7 +34,7 @@ const decide = (tool: string, input: Record<string, unknown>) =>
   gateDecision(tool, input, { storeDir: store, allowlistPath: join(store, 'egress-allowlist.json'), cwd: root })
 const DENY = { deny: true, reason: 'protected-store-file' }
 
-it('the protected list is exactly the files of the card (four, and the approval bot\'s two)', () => {
+it('the protected list is exactly the files of the card (four, the approval bot\'s two, and the gate\'s own exceptions)', () => {
   expect([...PROTECTED_STORE_FILES].sort()).toEqual([...FILES].sort())
 })
 
@@ -89,6 +91,7 @@ describe('Bash is fail-closed on the protected files', () => {
     'cp /tmp/x store/bash-sandbox-write*',
     'cp /tmp/x store/email-standing*',
     'cp /tmp/x store/.approval-bot*',
+    'cp /tmp/x store/self-pace-exc*',
   ])('a glob that starts on the name is denied: %s', (command) => {
     expect(decide('Bash', { command })).toEqual(DENY)
   })

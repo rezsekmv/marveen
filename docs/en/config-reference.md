@@ -23,6 +23,7 @@ These files are managed by the dashboard and change at runtime. They are not che
 | `store/claudeclaw.db` | not directly | SQLite database -- memory, kanban, messages, token log, etc. |
 | `store/config-overrides.json` | dashboard UI | Settings-page overrides (plain values only, never contains secrets) |
 | `store/update.pid` | automatic | Update process PID file (concurrency lock) |
+| `store/self-pace-exceptions.json` | by hand (owner or main agent) | Optional, install-local exceptions to the sub-agent self-pace gate; a protected store file (direct writes by sub-agents are denied) -- see [self-pace-exceptions.json Structure](#self-pace-exceptionsjson-structure) |
 | `store/telegram-topics.json` | `/topic new <name>` (Telegram) | The named topics of the main chat: `{ "chatId", "topics": { "<name>": <message_thread_id> } }` (0600); written only while `TELEGRAM_TOPICS_ENABLED` is on |
 
 ### Dashboard language
@@ -346,6 +347,41 @@ FROM config_change_log ORDER BY created_at DESC LIMIT 20;
 ```
 
 Autonomy levels: `1` = notify only, `2` = propose + approval required, `3` = autonomous + reports afterwards. `locked: true` means max level is 1 (cannot be raised due to hard safety rule).
+
+---
+
+### self-pace-exceptions.json Structure
+
+The sub-agent self-pace gate (`scripts/self-pace-gate.mjs`) denies every `launchctl` write subcommand. This optional file grants ONE narrow exception, read by `scripts/self-pace-local-exceptions.mjs`: a listed agent may restart (kickstart) the owner's own launchd services.
+
+```json
+{
+  "launchctlKickstart": {
+    "ops-agent": ["com.example."]
+  }
+}
+```
+
+With this file, the agent whose project directory is `agents/ops-agent` may run exactly:
+
+```sh
+launchctl kickstart gui/<uid>/com.example.<name>
+launchctl kickstart -k gui/<uid>/com.example.<name>
+```
+
+(optionally as `/bin/launchctl`). Rules:
+
+- The WHOLE Bash command must be that one invocation, tokens separated by plain spaces: no `;`, `&&`, `||`, `|`, `&`, newline, redirect, subshell, `$`, backtick, quote, backslash, glob, `sudo` or `VAR=value` prefix. Anything else is judged exactly as without the file.
+- `<uid>` must be the numeric uid of the user the hook runs as; only the `gui/` domain is accepted (not `system/`, `user/`, ...).
+- Labels are lowercase only: the whole label may contain just `a-z`, `0-9`, `.` and `-` (no uppercase, no `_`, no `@` or anything else). A service whose label does not fit cannot be granted.
+- `<name>` must match `[a-z0-9][a-z0-9.-]*` after a configured prefix. A prefix must be at least TWO dot-terminated components (`[a-z0-9][a-z0-9-]*.` repeated, e.g. `com.example.`); a single component such as `com.` or `hu.` is rejected, and invalid entries are ignored.
+- The prefix must NOT overlap the install's own launchd labels (the dashboard, channel and agent services, e.g. `com.marveen.`): restarting those would let a sub-agent restart the dashboard, the gates or another agent, i.e. wake itself or a peer, which is exactly the self-pace this gate exists to stop.
+- Only the kickstart flag `-k` is accepted; `-p`, `-s` and every other `launchctl` subcommand stay denied.
+- Missing, unreadable, symlinked or malformed file = no exception (fail closed). The path is fixed (`store/` next to the gate); no environment variable can move it.
+- If `scripts/self-pace-local-exceptions.mjs` itself is missing or broken, the gate still runs, just without any exception.
+- The exception only lifts the `launchctl` scheduler deny. Every other gate check (protected store files, the schedule surface, tmux injection, ...) still runs on the same command.
+- The file is a protected store file of the same gate and gets exactly the same protection as the others: a direct write, move, delete or redirect into it by any sub-agent, the listed one included (Bash or the Write/Edit tools), is denied; reading it is allowed. Its writers are the owner and the main agent. That protection is a casual-route check, not a sandbox: today it does not catch a name spliced with quotes (`self-pace-exceptions"".json`) or a short glob (`store/self*`), the same gap as for the other protected store files; a hardening follow-up covers it.
+- Defense in depth: the gate itself checks the strict `launchctl kickstart` shape before it asks the module, so even a buggy or replaced module cannot exempt any other command.
 
 ---
 
